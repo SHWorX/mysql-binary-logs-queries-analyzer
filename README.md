@@ -1,5 +1,5 @@
 [TOC]
-# MySQL Binary Logs Analyzer
+# MySQL Binary Logs Queries Analyzer
 
 ## Description
 This tool helps to analyze the MySQL/MariaDB binary log files. The generated report will give an overview of
