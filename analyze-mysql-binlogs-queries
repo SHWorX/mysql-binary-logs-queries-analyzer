@@ -284,7 +284,6 @@ def checkWorkingParameters(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName,
     regexTimestamp = re.compile(r'\d{10}')
     dtNow = datetime.datetime.now()
     startOfDay = dtNow.replace(hour=0, minute=0, second=0, microsecond=0)
-    endOfDay = startOfDay + datetime.timedelta(hours=23, minutes=59, seconds=59)
     allowedOperations = ['all', 'update', 'insert', 'delete', 'drop', 'truncate']
 
     # Check if start datetime is given in expected formats, otherwise use current day as start
@@ -729,7 +728,7 @@ def main(argv):
 
     for opt, arg in opts:
         if opt == '-h':
-            Printer.default('USAGE: analyze-mysql-binlogs --dt-from=<datetime> --dt-end=<datetime> '
+            Printer.default('USAGE: analyze-mysql-binlogs-queries --dt-from=<datetime> --dt-end=<datetime> '
                             '--binary-logs-file-name=<file-name-without-extension> --binary-logs-file-path=<path> '
                             '--output-path=<output-path> --sql-operations=<operations>')
             Printer.default('-h\t\t\t\t\t\tShows this help')

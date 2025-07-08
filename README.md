@@ -76,47 +76,47 @@ If you want (or if necessary), you can specify some working parameters.
 
 #### No arguments ####
 ```bash
-user@machine:~$ analyze-mysqlbinlogs
+user@machine:~$ analyze-mysql-binlogs-queries
 ```
 
 #### Specify binary logs file name (without extension!) ####
 ```bash
-user@machine:~$ analyze-mysqlbinlogs -n my-binary-logs
+user@machine:~$ analyze-mysql-binlogs-queries -n my-binary-logs
 ```
 
 #### Specify binary logs file path ####
 ```bash
-user@machine:~$ analyze-mysqlbinlogs -p /var/lib/mysql
+user@machine:~$ analyze-mysql-binlogs-queries -p /var/lib/mysql
 ```
 
 #### Specify output path ####
 ```bash
-user@machine:~$ analyze-mysqlbinlogs -o /path/where/output/files/shall/be/saved/
+user@machine:~$ analyze-mysql-binlogs-queries -o /path/where/output/files/shall/be/saved/
 ```
 
 #### Specify start and end date ####
 ```bash
-user@machine:~$ analyze-mysqlbinlogs -f 2023-11-08 -t 2023-11-09
+user@machine:~$ analyze-mysql-binlogs-queries -f 2023-11-08 -t 2023-11-09
 ```
 
 #### Specify start datetime and end date ####
 ```bash
-user@machine:~$ analyze-mysqlbinlogs -f 2023-11-08 08:20:00 -t 2023-11-09
+user@machine:~$ analyze-mysql-binlogs-queries -f 2023-11-08 08:20:00 -t 2023-11-09
 ```
 
 #### Specify start and end datetime via unix timestamp ####
 ```bash
-user@machine:~$ analyze-mysqlbinlogs -f 1699402800 -t 1699545599
+user@machine:~$ analyze-mysql-binlogs-queries -f 1699402800 -t 1699545599
 ```
 
 #### Specify the operations included in the report ####
 ```bash
-user@machine:~$ analyze-mysqlbinlogs -s update,insert,delete
+user@machine:~$ analyze-mysql-binlogs-queries -s update,insert,delete
 ```
 
 ### Full list of available options/arguments
 ```bash
-user@machine:~$ analyze-mysqlbinlogs -h
+user@machine:~$ analyze-mysql-binlogs-queries -h
 USAGE: analyze-mysql-binlogs --dt-from=<datetime> --dt-end=<datetime> --binary-logs-file-name=<file-name-without-extension> --binary-logs-file-path=<path> --output-path=<output-path>
 -h                                              Shows this help
 -f      --dt-from=<datetime>                    The start date(time) the binary logs are created to analyze (allowed formats: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, Unix timestamp)
