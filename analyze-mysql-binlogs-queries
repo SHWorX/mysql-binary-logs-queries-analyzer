@@ -404,7 +404,7 @@ def checkWorkingParameters(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName,
                     'Binary logs path:\t\t\t\t{}\n'
                     'Binary logs filename (without extension):\t{}\n'
                     'Output path:\t\t\t\t\t{}\n'
-                    'SQL operations:\t\t\t\t\t{}'
+                    'SQL operations:\t\t\t\t\t{}\n'
                     'Skip GTID strict mode:\t\t\t\t{}'
                     .format(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName, outputFilePath, sqlOperations, skipGtidStrictMode))
     Printer.default('=====================================================')
@@ -686,6 +686,8 @@ def run(dtFrom: str, dtTo: str, binaryLogsFilePath: str, binaryLogsFileName: str
         The path where the output files shall be saved. (default: /var/lib/mysql)
     sqlOperations : str
         The SQL operations which should be taken into the report (default: all)
+    skipGtidStrictMode : bool
+        Enable/Disable the mysqlbinlog argument '--skipGtidStrictMode'
     """
 
     params = checkWorkingParameters(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName, outputPath, sqlOperations, skipGtidStrictMode)
@@ -724,11 +726,11 @@ def main(argv):
     binaryLogsFilePath = ''
     outputPath = ''
     sqlOperations = ''
-    skipGtidStrictMode = True
+    tmpSkipGtidStrictMode = ''
 
     opts, args = getopt.getopt(
         argv,
-        'hf:t:n:p:o:s:l:',
+        'hf:t:n:p:o:s:g',
         [
             'dt-from=',
             'dt-to=',
@@ -780,7 +782,12 @@ def main(argv):
         elif opt in ('-s', '--sql-operations'):
             sqlOperations = arg
         elif opt in ('-g', '--no-skip-gtid-strict-mode'):
-            skipGtidStrictMode = True
+            tmpSkipGtidStrictMode = 'False'
+
+    if tmpSkipGtidStrictMode == 'False':
+        skipGtidStrictMode = False
+    else:
+        skipGtidStrictMode = True
 
     Printer.default('+---------------------------------------------------+\n'
                     '|  G I V E N   W O R K I N G   P A R A M E T E R S  |\n'
@@ -790,9 +797,10 @@ def main(argv):
                     'Binary logs path:\t\t\t\t{}\n'
                     'Binary logs filename (without extension):\t{}\n'
                     'Output path:\t\t\t\t\t{}\n'
-                    'SQL operations:\t\t\t\t\t{}'
+                    'SQL operations:\t\t\t\t\t{}\n'
                     'Skip GTID strict mode:\t\t\t\t{}'
-                    .format(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName, outputPath, sqlOperations))
+                    .format(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName, outputPath, sqlOperations,
+                            tmpSkipGtidStrictMode))
     Printer.default('=====================================================')
 
     run(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName, outputPath, sqlOperations, skipGtidStrictMode)
