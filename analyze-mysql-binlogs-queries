@@ -221,8 +221,6 @@ def decodeAndCombineBinaryLogs(rawLog, binaryLogs, skipGtidStrictMode):
         Enable/Disable the mysqlbinlog argument '--skipGtidStrictMode'
     """
 
-    command = ['mysqlbinlog', '--base64-output=decode-rows', '-v', '--skip-gtid-strict-mode']
-
     command = ['mysqlbinlog', '--base64-output=decode-rows', '-v']
 
     if skipGtidStrictMode:
