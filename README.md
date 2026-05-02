@@ -130,4 +130,5 @@ USAGE: analyze-mysql-binlogs --dt-from=<datetime> --dt-end=<datetime> --binary-l
 -o      --output-path=<output-path>             The path where the output files are saved (default: <current-directory>)
 -s      --sql-operations=<operations>           The SQL operations which shall be included in the report (default: all)
                                                 Multiple types should be separated by comma. Example: --sql-operations=update,insert,delete
+-g      --no-skip-gtid-strict-mode              Disable mysqlbinlog option --skip-gtid-strict-mode (argument is enabled by default)
 ```
