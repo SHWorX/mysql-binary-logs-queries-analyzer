@@ -767,7 +767,7 @@ def main(argv):
             Printer.default('\t\t\t\t\t\tMultiple types should be separated by comma. '
                             'Example: --sql-operations=update,insert,delete')
             Printer.default('-g\t--no-skip-gtid-strict-mode\t\tDisable mysqlbinlog option --skip-gtid-strict-mode '
-                            '(enabled by default)')
+                            '(argument is enabled by default)')
             sys.exit()
         elif opt in ('-f', '--dt-from'):
             dtFrom = arg
