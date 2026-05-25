@@ -1,17 +1,6 @@
 [TOC]
 # MySQL Binary Logs Queries Analyzer
 
-## VERY IMPORTANT NOTE
-\########################################################################
-
-This repository has moved to **CODEBERG.ORG**.  
-The repository here on Github will **NOT RECEIVE ANY UPDATES ANYMORE**.  
-The repository here on Github is **now ARCHIVED AND READ-ONLY**.
-
-NEW REPOSITORY URL: [https://codeberg.org/SHWorX/mysql-binary-logs-queries-analyzer](https://codeberg.org/SHWorX/mysql-binary-logs-queries-analyzer)
-
-\########################################################################
-
 ## Description
 This tool helps to analyze the MySQL/MariaDB binary log files. The generated report will give an overview of
 how many UPDATE, INSERT, DELETE, DROP and TRUNCATE operations appear in the binary logs. This report can help
