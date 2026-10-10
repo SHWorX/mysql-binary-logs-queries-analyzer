@@ -45,44 +45,38 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 # ========  CONSTANTS  ========
+SCRIPT_VERSION = "1.0.0"
 ALL_OPERATIONS = ('update', 'insert', 'delete', 'truncate', 'drop')
 DEFAULT_LOG_DIR = Path('/var/lib/mysql')
 DEFAULT_LOG_NAME = 'mysql-bin'
 DATETIME_FORMAT = '%Y-%m-%d %H:%M:%S'
 
-# Row-based events (mysqlbinlog -v):  "### INSERT INTO `db`.`tbl`"
+# Row-based events (mysqlbinlog -v), example: "### INSERT INTO `db`.`tbl`"
 ROW_RE = re.compile(r'^### (INSERT INTO|UPDATE|DELETE FROM) (\S+)')
 ROW_OPERATIONS = {'INSERT INTO': 'insert', 'UPDATE': 'update', 'DELETE FROM': 'delete'}
 
 # Statement-based events (binlog_format=STATEMENT/MIXED) and DDL.
 _NAME = r'([`\w.$]+)'
 STATEMENT_RES = {
-    'insert': re.compile(
-        rf'^INSERT\s+(?:(?:LOW_PRIORITY|DELAYED|HIGH_PRIORITY|IGNORE)\s+)*INTO\s+{_NAME}', re.I),
-    'update': re.compile(
-        rf'^UPDATE\s+(?:(?:LOW_PRIORITY|IGNORE)\s+)*{_NAME}', re.I),
-    'delete': re.compile(
-        rf'^DELETE\s+(?:(?:LOW_PRIORITY|QUICK|IGNORE)\s+)*FROM\s+{_NAME}', re.I),
-    'truncate': re.compile(
-        rf'^TRUNCATE\s+(?:TABLE\s+)?{_NAME}', re.I),
-    'drop': re.compile(
-        rf'^DROP\s+(?:TEMPORARY\s+)?(?:TABLE|DATABASE|SCHEMA|VIEW|INDEX)\s+(?:IF\s+EXISTS\s+)?{_NAME}', re.I),
+    'insert': re.compile(rf'^INSERT\s+(?:(?:LOW_PRIORITY|DELAYED|HIGH_PRIORITY|IGNORE)\s+)*INTO\s+{_NAME}', re.I),
+    'update': re.compile(rf'^UPDATE\s+(?:(?:LOW_PRIORITY|IGNORE)\s+)*{_NAME}', re.I),
+    'delete': re.compile(rf'^DELETE\s+(?:(?:LOW_PRIORITY|QUICK|IGNORE)\s+)*FROM\s+{_NAME}', re.I),
+    'truncate': re.compile(rf'^TRUNCATE\s+(?:TABLE\s+)?{_NAME}', re.I),
+    'drop': re.compile(rf'^DROP\s+(?:TEMPORARY\s+)?(?:TABLE|DATABASE|SCHEMA|VIEW|INDEX)\s+(?:IF\s+EXISTS\s+)?{_NAME}', re.I),
 }
-# mysqlbinlog stderr lines that are expected and harmless (the requested window simply
-# extends beyond the end of a file).
+# mysqlbinlog stderr lines that are expected and harmless (the requested window simply extends beyond the end of a file).
 BENIGN_STDERR_RE = re.compile(r"^WARNING: Did not reach stop datetime\b")
 
-# Cheap pre-filter: every keyword above starts with one of these characters.
+# Cheap pre-filter: Every keyword above starts with one of these characters.
 STATEMENT_FIRST_CHARS = frozenset('IUDTiudt')
-# In "### ..." lines only the row header lines (INSERT INTO / UPDATE / DELETE FROM) have
-# one of these at index 4; "### WHERE", "### SET" and "###   @1=..." lines do not.
+# In "### ..." lines only the row header lines (INSERT INTO / UPDATE / DELETE FROM) have  one of these at index 4;
+# "### WHERE", "### SET" and "###   @1=..." lines do not.
 ROW_FIRST_CHARS = frozenset('IUD')
 
 # Statements in mysqlbinlog output are terminated by this delimiter.
 STATEMENT_END = '/*!*/;'
 
-# Event header line, e.g.
-#   #241206 12:09:28 server id 1  end_log_pos 123 CRC32 0x0b7a9f85  Update_rows: ...
+# Event header line, e.g. #241206 12:09:28 server id 1  end_log_pos 123 CRC32 0x0b7a9f85  Update_rows: ...
 EVENT_RE = re.compile(
     r'^#(\d{6})\s+(\d{1,2}:\d{2}:\d{2})\s+server id \d+\s+end_log_pos \d+'
     r'(?:\s+CRC32 0x[0-9a-fA-F]+)?\s+(\w+)')
@@ -147,7 +141,7 @@ class BinlogAnalysisError(Exception):
 @dataclass(frozen=True)
 class Config:
     dt_from: datetime
-    dt_to: datetime                 # inclusive
+    dt_to: datetime
     log_dir: Path
     log_name: str
     output_dir: Path
@@ -157,7 +151,7 @@ class Config:
     mysqlbinlog: str
     ignore_mtime: bool
     write_queries: bool = False
-    query_samples: int = 1          # per operation and table; 0 = all
+    query_samples: int = 1
 
 
 def parse_datetime(value: str, end_of_day: bool = False) -> datetime:
@@ -202,51 +196,85 @@ def build_parser() -> argparse.ArgumentParser:
         prog='analyze-mysql-binlogs-queries',
         description='Count INSERT/UPDATE/DELETE/TRUNCATE/DROP operations per table in MySQL/MariaDB binary logs.')
     parser.add_argument(
-        '-f', '--dt-from', type=parse_datetime, metavar='DATETIME',
+        '-f', '--dt-from',
+        type=parse_datetime,
+        metavar='DATETIME',
         help='Start of the analyzed period (YYYY-MM-DD, "YYYY-MM-DD HH:MM:SS" or Unix timestamp). '
              'A bare date means 00:00:00. Default: today 00:00:00.')
     parser.add_argument(
-        '-t', '--dt-to', type=parse_datetime_end, metavar='DATETIME',
+        '-t', '--dt-to',
+        type=parse_datetime_end,
+        metavar='DATETIME',
         help='End of the analyzed period, inclusive (same formats). A bare date means 23:59:59. '
              'Default: today 23:59:59.')
     parser.add_argument(
-        '-n', '--binary-logs-file-name', default=DEFAULT_LOG_NAME, metavar='NAME',
+        '-n', '--binary-logs-file-name',
+        default=DEFAULT_LOG_NAME,
+        metavar='NAME',
         help=f'Binary log base name without the numeric extension (default: {DEFAULT_LOG_NAME}).')
     parser.add_argument(
-        '-p', '--binary-logs-file-path', type=Path, default=DEFAULT_LOG_DIR, metavar='PATH',
+        '-p', '--binary-logs-file-path',
+        type=Path,
+        default=DEFAULT_LOG_DIR,
+        metavar='PATH',
         help=f'Directory containing the binary logs (default: {DEFAULT_LOG_DIR}).')
     parser.add_argument(
-        '-o', '--output-path', type=Path, default=None, metavar='PATH',
+        '-o', '--output-path',
+        type=Path,
+        default=None,
+        metavar='PATH',
         help='Directory for the report files (default: current directory).')
     parser.add_argument(
-        '-s', '--sql-operations', type=parse_operations, default=ALL_OPERATIONS, metavar='OPS',
+        '-s', '--sql-operations',
+        type=parse_operations,
+        default=ALL_OPERATIONS,
+        metavar='OPS',
         help='Comma separated operations to report: all, update, insert, delete, truncate, drop '
              '(default: all). Example: --sql-operations=update,insert')
     parser.add_argument(
-        '-g', '--no-skip-gtid-strict-mode', action='store_true',
+        '-g', '--no-skip-gtid-strict-mode',
+        action='store_true',
         help='Never pass --skip-gtid-strict-mode to mysqlbinlog. By default it is passed only if '
              'a MariaDB mysqlbinlog is detected (MySQL does not support it).')
     parser.add_argument(
-        '-j', '--jobs', type=int, default=min(4, os.cpu_count() or 1), metavar='N',
+        '-j', '--jobs',
+        type=int,
+        default=min(4, os.cpu_count() or 1),
+        metavar='N',
         help='Number of mysqlbinlog processes to run in parallel (default: min(4, CPU count)).')
     parser.add_argument(
-        '--mysqlbinlog', default='mysqlbinlog', metavar='BIN',
+        '--mysqlbinlog',
+        default='mysqlbinlog',
+        metavar='BIN',
         help='Name or path of the mysqlbinlog executable (default: mysqlbinlog).')
     parser.add_argument(
-        '--ignore-mtime', action='store_true',
+        '--ignore-mtime',
+        action='store_true',
         help='Do not pre-select log files by modification time; rely only on mysqlbinlog\'s event '
              'timestamps. Use this if the logs were copied/restored and their mtimes are unreliable.')
     parser.add_argument(
-        '-q', '--write-queries', action='store_true',
+        '-q', '--write-queries',
+        action='store_true',
         help='Additionally write one file per operation type (<ts>_binary-logs-<op>-queries.sql) '
              'containing the full SQL of sample queries found in the logs. Note: SELECT statements '
              'are never written to binary logs, so they can not appear.')
     parser.add_argument(
-        '--query-samples', type=int, default=1, metavar='N',
+        '--query-samples',
+        type=int,
+        default=1,
+        metavar='N',
         help='With --write-queries: how many example queries to keep per operation and table '
              '(default: 1). Use 0 to write ALL queries (can produce very large files).')
     parser.add_argument(
-        '--no-color', action='store_true', help='Disable colored output.')
+        '--no-color',
+        action='store_true',
+        help='Disable colored output.')
+    parser.add_argument(
+        '-v', '--version',
+        action='version',
+        version=f'%(prog)s {SCRIPT_VERSION}',
+        help='Show the script version and exit.'
+    )
     return parser
 
 
@@ -302,6 +330,7 @@ def is_mariadb(mysqlbinlog: str) -> bool:
 
 
 def print_config(cfg: Config) -> None:
+    Printer.tool('MySQL Binary Logs Analyzer v' + SCRIPT_VERSION)
     Printer.default('+---------------------------------------------------+\n'
                     '|  F I N A L   W O R K I N G   P A R A M E T E R S  |\n'
                     '+---------------------------------------------------+')
@@ -326,7 +355,7 @@ def find_binlogs(cfg: Config) -> List[str]:
     """Return the binary logs that can contain events inside the time window,
     sorted by their numeric extension.
 
-    A binlog's mtime is the time of its *last* write, so:
+    A bin log's mtime is the time of its *last* write, so:
       * a file whose mtime is before the window start cannot contain relevant events;
       * the first file whose mtime is at/after the window end may still hold events
         from inside the window (it started before the end), but every file after it
@@ -430,15 +459,14 @@ def analyze_file(base_command: Sequence[str], binlog: str, operations: Sequence[
     counts = {op: Counter() for op in operations}
     sampler = _SampleWriter(samples_path, Path(binlog).name, samples_per_table) if samples_path else None
 
-    # Parser state, only used when sampling queries.
-    last_at = ''                    # position from the last "# at N" line
-    event_ts = ''                   # timestamp of the current event
-    event_pos = ''                  # start position of the current event
-    rows_query: Optional[List[str]] = None   # original SQL of a Rows_query event
+    last_at = ''
+    event_ts = ''
+    event_pos = ''
+    rows_query: Optional[List[str]] = None
     collecting_rows_query = False
-    row_lines: Optional[List[str]] = None    # "###" block of the row being captured
+    row_lines: Optional[List[str]] = None
     row_meta = None
-    stmt_lines: Optional[List[str]] = None   # statement being captured
+    stmt_lines: Optional[List[str]] = None
     stmt_meta = None
 
     def finish_row() -> None:
@@ -464,10 +492,9 @@ def analyze_file(base_command: Sequence[str], binlog: str, operations: Sequence[
             try:
                 for line in process.stdout:
                     if sampler is not None:
-                        # Statement being captured: runs until its delimiter line.
                         if stmt_lines is not None:
                             if line.startswith('# at '):
-                                finish_stmt()          # unexpected end, keep what we have
+                                finish_stmt()
                             else:
                                 stmt_lines.append(line)
                                 if line.rstrip().endswith(STATEMENT_END):
@@ -488,7 +515,7 @@ def analyze_file(base_command: Sequence[str], binlog: str, operations: Sequence[
                             match = ROW_RE.match(line)
                             if match:
                                 if row_lines is not None:
-                                    finish_row()       # previous row of the same event
+                                    finish_row()
                                 op = ROW_OPERATIONS[match.group(1)]
                                 if op in wanted:
                                     table = _clean_name(match.group(2))
@@ -542,9 +569,8 @@ def analyze_file(base_command: Sequence[str], binlog: str, operations: Sequence[
 
         if process.returncode != 0:
             stderr_file.seek(0)
-            # Drop warnings that are expected when the window extends past the end of a
-            # file; some mysqlbinlog versions exit non-zero for them although all events
-            # were printed. Anything else is a real failure.
+            # Drop warnings that are expected when the window extends past the end of a file; Some mysqlbinlog versions
+            # exit non-zero for them although all events were printed. Anything else is a real failure.
             lines = [line.strip() for line in stderr_file.read().splitlines() if line.strip()]
             problems = [line for line in lines if not BENIGN_STDERR_RE.match(line)]
             if problems or not lines:
@@ -575,14 +601,12 @@ def analyze_all(cfg: Config, binlogs: Sequence[str],
     workers = min(cfg.jobs, len(binlogs))
     if workers <= 1:
         for index, binlog in enumerate(binlogs):
-            merge(*analyze_file(base_command, binlog, cfg.operations,
-                                samples_path(index), cfg.query_samples))
+            merge(*analyze_file(base_command, binlog, cfg.operations, samples_path(index), cfg.query_samples))
         return total
 
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(analyze_file, base_command, b, cfg.operations,
-                               samples_path(i), cfg.query_samples)
-                   for i, b in enumerate(binlogs)]
+                               samples_path(i), cfg.query_samples) for i, b in enumerate(binlogs)]
         try:
             for future in as_completed(futures):
                 merge(*future.result())
@@ -674,7 +698,6 @@ def run(cfg: Config) -> int:
     report_file = cfg.output_dir / f'{stamp}_binary-logs-report.txt'
     list_file = cfg.output_dir / f'{stamp}_binary-logs-list.txt'
 
-    # Private scratch directory (0700) for the sampled queries; always removed again.
     samples_dir = (tempfile.mkdtemp(prefix='.binlog-queries-', dir=cfg.output_dir)
                    if cfg.write_queries else None)
     try:
