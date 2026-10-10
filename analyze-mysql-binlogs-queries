@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 
 # (C) 2023 Steffen Haase <shworx.development@gmail.com>
 #
@@ -15,795 +15,709 @@
 # this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
-import datetime
-import getopt
-import getpass
+"""Analyze MySQL/MariaDB binary logs and report operation counts per table.
+
+How it works
+------------
+1. Select the binary logs that can contain events in the requested time window.
+2. Run ``mysqlbinlog`` once per log file (in parallel) and *stream* its output,
+   counting INSERT / UPDATE / DELETE / TRUNCATE / DROP operations per table in
+   a single pass. Nothing decoded is ever written to disk.
+3. Merge the per-file counters and write a report plus a list of analyzed logs.
+4. Optionally (--write-queries) also collect sample SQL queries per operation and table
+   and write them to one file per operation type.
+"""
+
+import argparse
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+# ========  CONSTANTS  ========
+ALL_OPERATIONS = ('update', 'insert', 'delete', 'truncate', 'drop')
+DEFAULT_LOG_DIR = Path('/var/lib/mysql')
+DEFAULT_LOG_NAME = 'mysql-bin'
+DATETIME_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+# Row-based events (mysqlbinlog -v):  "### INSERT INTO `db`.`tbl`"
+ROW_RE = re.compile(r'^### (INSERT INTO|UPDATE|DELETE FROM) (\S+)')
+ROW_OPERATIONS = {'INSERT INTO': 'insert', 'UPDATE': 'update', 'DELETE FROM': 'delete'}
+
+# Statement-based events (binlog_format=STATEMENT/MIXED) and DDL.
+_NAME = r'([`\w.$]+)'
+STATEMENT_RES = {
+    'insert': re.compile(
+        rf'^INSERT\s+(?:(?:LOW_PRIORITY|DELAYED|HIGH_PRIORITY|IGNORE)\s+)*INTO\s+{_NAME}', re.I),
+    'update': re.compile(
+        rf'^UPDATE\s+(?:(?:LOW_PRIORITY|IGNORE)\s+)*{_NAME}', re.I),
+    'delete': re.compile(
+        rf'^DELETE\s+(?:(?:LOW_PRIORITY|QUICK|IGNORE)\s+)*FROM\s+{_NAME}', re.I),
+    'truncate': re.compile(
+        rf'^TRUNCATE\s+(?:TABLE\s+)?{_NAME}', re.I),
+    'drop': re.compile(
+        rf'^DROP\s+(?:TEMPORARY\s+)?(?:TABLE|DATABASE|SCHEMA|VIEW|INDEX)\s+(?:IF\s+EXISTS\s+)?{_NAME}', re.I),
+}
+# mysqlbinlog stderr lines that are expected and harmless (the requested window simply
+# extends beyond the end of a file).
+BENIGN_STDERR_RE = re.compile(r"^WARNING: Did not reach stop datetime\b")
+
+# Cheap pre-filter: every keyword above starts with one of these characters.
+STATEMENT_FIRST_CHARS = frozenset('IUDTiudt')
+# In "### ..." lines only the row header lines (INSERT INTO / UPDATE / DELETE FROM) have
+# one of these at index 4; "### WHERE", "### SET" and "###   @1=..." lines do not.
+ROW_FIRST_CHARS = frozenset('IUD')
+
+# Statements in mysqlbinlog output are terminated by this delimiter.
+STATEMENT_END = '/*!*/;'
+
+# Event header line, e.g.
+#   #241206 12:09:28 server id 1  end_log_pos 123 CRC32 0x0b7a9f85  Update_rows: ...
+EVENT_RE = re.compile(
+    r'^#(\d{6})\s+(\d{1,2}:\d{2}:\d{2})\s+server id \d+\s+end_log_pos \d+'
+    r'(?:\s+CRC32 0x[0-9a-fA-F]+)?\s+(\w+)')
+ROW_EVENT_PREFIXES = ('Table_map', 'Write_rows', 'Update_rows', 'Delete_rows')
 
 
-# ========  CLASSES  ========
-class BColors:
-    """This class contains the color and font formatting (bold, underline) definitions for messages."""
-
-    # ==== COLORS ====
-    WARNING = '\033[93m'  # light yellow
-    """Light yellow"""
-
-    ERROR = '\033[91m'  # light red
-    """Light red"""
-
-    BLUE = '\033[34m'
-    LIGHTBLUE = '\033[94m'
-    LIGHTGREEN = '\033[92m'
-    CYAN = '\033[36m'
-    DEFAULTCOLOR = '\033[39m'
-
-    # ==== STYLES ====
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
-    DEFAULT = '\033[0m'
-
-
+# ========  OUTPUT  ========
 class Printer:
-    """Provides methods to print out formatted/colored messages."""
+    """Prints formatted messages. Colors are only used when stdout is a TTY
+    (and NO_COLOR is not set), so redirected output stays free of escape codes."""
 
-    @staticmethod
-    def error(msg, bold=False, prefix=True, startNewline=False, endNewline=True):
-        """Prints an error message (light red).
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    COLORS = {
+        'error': '\033[91m',
+        'warning': '\033[93m',
+        'success': '\033[92m',
+        'tool': '\033[36m',
+        'default': '',
+    }
+    color_enabled = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
 
-        Parameter
-        ---------
-        msg : str
-            The message to print.
-        bold : bool, default: False
-            Shall the msg printed in bold text.
-        prefix : bool, default: True
-            Shall the message have the prefix "ERROR: ".
-        startNewline : bool, default: False
-            Shall the message begin with a newline character
-        endNewline : bool, default: True
-            Shall the message end with a newline character
-        """
+    @classmethod
+    def _emit(cls, kind, msg, bold=False, prefix=None, end='\n', stream=None):
+        stream = stream or sys.stdout
+        use_color = cls.color_enabled and stream.isatty()
+        color = cls.COLORS[kind]
+        if use_color and (color or bold):
+            style = (cls.BOLD if bold else '') + color
+            msg = f'{style}{msg}{cls.RESET}'
+        if prefix:
+            tag = f'{cls.BOLD}{color}{prefix}{cls.RESET}' if use_color else prefix
+            msg = f'{tag} {msg}'
+        print(msg, end=end, file=stream, flush=True)
 
-        output = BColors.ERROR + msg + BColors.DEFAULT
-        output = BColors.BOLD + output + BColors.DEFAULT if bold else output
-        output = BColors.ERROR + BColors.BOLD + "ERROR: " + BColors.DEFAULT + output if prefix else output
-        output = "\n" + output if startNewline else output
-        if endNewline:
-            print(output)
-        else:
-            print(output, end="")
+    @classmethod
+    def error(cls, msg, **kw):
+        cls._emit('error', msg, prefix='ERROR:', stream=sys.stderr, **kw)
 
-    @staticmethod
-    def warning(msg, bold=False, prefix=True, startNewline=False, endNewline=True):
-        """Prints a warning message (light yellow).
+    @classmethod
+    def warning(cls, msg, **kw):
+        cls._emit('warning', msg, prefix='WARNING:', stream=sys.stderr, **kw)
 
-        Parameter
-        ---------
-        msg : str
-            The message to print.
-        bold : bool, default: False
-            Shall the msg printed in bold text.
-        prefix : bool, default: True
-            Shall the message have the prefix "WARNING: ".
-        startNewline : bool, default: False
-            Shall the message begin with a newline character
-        endNewline : bool, default: True
-            Shall the message end with a newline character
-        """
-        output = BColors.WARNING + msg + BColors.DEFAULT
-        output = BColors.BOLD + output + BColors.DEFAULT if bold else output
-        output = BColors.WARNING + BColors.BOLD + "WARNING: " + BColors.DEFAULT + output if prefix else output
-        output = "\n" + output if startNewline else output
-        if endNewline:
-            print(output)
-        else:
-            print(output, end="")
+    @classmethod
+    def success(cls, msg, **kw):
+        cls._emit('success', msg, **kw)
 
-    @staticmethod
-    def success(msg, bold=False, startNewline=False, endNewline=True):
-        """Prints a success message (green).
+    @classmethod
+    def tool(cls, msg, **kw):
+        cls._emit('tool', msg, **kw)
 
-        Parameter
-        ---------
-        msg : str
-            The message to print.
-        bold : bool, default: False
-            Shall the msg printed in bold text.
-        prefix : bool, default: True
-            Shall the message have the prefix "ERROR: ".
-        startNewline : bool, default: False
-            Shall the message begin with a newline character
-        endNewline : bool, default: True
-            Shall the message end with a newline character
-        """
-        output = BColors.LIGHTGREEN + msg + BColors.DEFAULT
-        output = BColors.BOLD + output + BColors.DEFAULT if bold else output
-        output = "\n" + output if startNewline else output
-        if endNewline:
-            print(output)
-        else:
-            print(output, end="")
-
-    @staticmethod
-    def tool(msg, bold=False, startNewline=False, endNewline=True):
-        """Prints a tool message (cyan).
-
-        Parameter
-        ---------
-        msg : str
-            The message to print.
-        bold : bool, default: False
-            Shall the msg printed in bold text.
-        startNewline : bool, default: False
-            Shall the message begin with a newline character
-        endNewline : bool, default: True
-            Shall the message end with a newline character
-        """
-        output = BColors.CYAN + msg + BColors.DEFAULT
-        output = BColors.BOLD + output + BColors.DEFAULT if bold else output
-        output = "\n" + output if startNewline else output
-        if endNewline:
-            print(output)
-        else:
-            print(output, end="")
-
-    @staticmethod
-    def default(msg, bold=False, startNewline=False, endNewline=True):
-        """Prints message (default color).
-
-        Parameter
-        ---------
-        msg : str
-            The message to print.
-        bold : bool, default: False
-            Shall the msg printed in bold text.
-        startNewline : bool, default: False
-            Shall the message begin with a newline character
-        endNewline : bool, default: True
-            Shall the message end with a newline character
-        """
-        output = BColors.BOLD + msg + BColors.DEFAULT if bold else msg
-        output = "\n" + output if startNewline else output
-        if endNewline:
-            print(output)
-        else:
-            print(output, end="")
-# ========  END OF CLASSES  ========
+    @classmethod
+    def default(cls, msg, **kw):
+        cls._emit('default', msg, **kw)
 
 
-# ========  FUNCTIONS  ========
-def getModifiedDateTime(file):
-    """Returns the mtime of the file.
+class BinlogAnalysisError(Exception):
+    """Raised when mysqlbinlog fails for a file."""
 
-    Parameter
-    ---------
-    file: str
 
-    Returns
-    -------
-    datetime : datetime
+# ========  CONFIGURATION  ========
+@dataclass(frozen=True)
+class Config:
+    dt_from: datetime
+    dt_to: datetime                 # inclusive
+    log_dir: Path
+    log_name: str
+    output_dir: Path
+    operations: Tuple[str, ...]
+    skip_gtid_strict_mode: bool
+    jobs: int
+    mysqlbinlog: str
+    ignore_mtime: bool
+    write_queries: bool = False
+    query_samples: int = 1          # per operation and table; 0 = all
+
+
+def parse_datetime(value: str, end_of_day: bool = False) -> datetime:
+    """Parse 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM:SS' or a 10-digit Unix timestamp.
+
+    A bare date becomes 00:00:00, or 23:59:59 when *end_of_day* is True.
     """
-
-    return datetime.datetime.fromtimestamp(os.path.getmtime(file))
-
-
-def getCreatedDateTime(file):
-    """Returns the ctime of the file.
-
-    Parameter
-    ---------
-    file: str
-
-    Returns
-    -------
-    datetime : datetime
-    """
-
-    return datetime.datetime.fromtimestamp(os.path.getctime(file))
-
-
-def decodeAndCombineBinaryLogs(rawLog, binaryLogs, skipGtidStrictMode):
-    """This method calls the "mysqlbinlog" command with the option "-v" and the binary logs as arguments,
-    and writes the output to "/output/path/mysql-raw.out".
-
-    Parameter
-    ---------
-    rawLog : str
-        Filename incl. path which will contain the decoded content of all given binary logs
-    binaryLogs : list[str]
-        List of binary logs
-    skipGtidStrictMode : bool
-        Enable/Disable the mysqlbinlog argument '--skipGtidStrictMode'
-    """
-
-    command = ['mysqlbinlog', '--base64-output=decode-rows', '-v']
-
-    if skipGtidStrictMode:
-        command.append('--skip-gtid-strict-mode')
-
-    commandWithFileList = command + binaryLogs
-
-    Printer.tool('Decoding binary logs and write the output to {} ... '.format(rawLog), endNewline=False)
-
+    value = value.strip()
+    if re.fullmatch(r'\d{10}', value):
+        return datetime.fromtimestamp(int(value))
     try:
-        with open(rawLog, 'w') as outputFileHandle:
-            subprocess.run(
-                commandWithFileList,
-                check=True,
-                stdout=outputFileHandle,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-        outputFileHandle.close()
-    except IOError as e:
-        Printer.error('Failed! (IOError)\n{}: {}'.format(e.strerror, rawLog), prefix=False)
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        error = e.stderr.replace('\n', '')
-        if error == '':
-            Printer.warning('mysqlbinlog exited with 1, but without error message.'.format(error), prefix=False)
-
-        if error != '':
-            Printer.error('Failed! (subprocess)\n{}'.format(error), prefix=False)
-            sys.exit(1)
-    else:
-        Printer.success('Done.')
+        day = datetime.strptime(value, '%Y-%m-%d')
+        return day.replace(hour=23, minute=59, second=59) if end_of_day else day
+    except ValueError:
+        pass
+    try:
+        return datetime.strptime(value, DATETIME_FORMAT)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f'invalid datetime "{value}" (use YYYY-MM-DD, "YYYY-MM-DD HH:MM:SS" or a Unix timestamp)')
 
 
-def checkWorkingParameters(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName, outputPath, sqlOperations, skipGtidStrictMode):
-    """Checks the given initial working parameters for valid values, prints out (and returns) the final working
-    parameter list
+def parse_datetime_end(value: str) -> datetime:
+    return parse_datetime(value, end_of_day=True)
 
-    Parameters
-    ----------
-    dtFrom : str
-        The start date/datetime/timestamp. Allowed formats: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, Unix timestamp
-    dtTo : str
-        The end date/datetime/timestamp.  Allowed formats: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, Unix timestamp
-    binaryLogsFilePath : str
-        The path where the binary logs file are located. (default: /var/lib/mysql)
-    binaryLogsFileName : str
-        The name of the binary log files without extension. (default: binlog)
-    outputPath : str
-        The path where the output files shall be saved. (default: /var/lib/mysql)
-    sqlOperations : str
-        The SQL operations which should be taken into the report (default: all)
-    skipGtidStrictMode : bool
-        Enable/Disable the mysqlbinlog argument '--skipGtidStrictMode'
 
-    Returns
-    -------
-    list
-        A list with the final working parameters:
+def parse_operations(value: str) -> Tuple[str, ...]:
+    """Normalize a comma separated operation list (case-insensitive)."""
+    requested = {item.strip().lower() for item in value.split(',') if item.strip()}
+    if not requested or 'all' in requested:
+        return ALL_OPERATIONS
+    unknown = requested - set(ALL_OPERATIONS)
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f'unknown SQL operation(s): {", ".join(sorted(unknown))} '
+            f'(allowed: all, {", ".join(ALL_OPERATIONS)})')
+    return tuple(op for op in ALL_OPERATIONS if op in requested)
 
-        [dtFrom : datetime, dtTo : datetime, binaryLogsFilePath : str, binaryLogsFileName : str, outputFilePath :
-        str, sqlOperations : str, binlogFormat : str, skipGtidStrictMode : bool]
-    """
 
-    Printer.tool('Checking working parameters ...')
-    currentUser = getpass.getuser()
-    regexDate = re.compile(r'\d{4}-\d{2}-\d{2}')
-    regexDateTime = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}')
-    regexTimestamp = re.compile(r'\d{10}')
-    dtNow = datetime.datetime.now()
-    startOfDay = dtNow.replace(hour=0, minute=0, second=0, microsecond=0)
-    allowedOperations = ['all', 'update', 'insert', 'delete', 'drop', 'truncate']
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='analyze-mysql-binlogs-queries',
+        description='Count INSERT/UPDATE/DELETE/TRUNCATE/DROP operations per table in MySQL/MariaDB binary logs.')
+    parser.add_argument(
+        '-f', '--dt-from', type=parse_datetime, metavar='DATETIME',
+        help='Start of the analyzed period (YYYY-MM-DD, "YYYY-MM-DD HH:MM:SS" or Unix timestamp). '
+             'A bare date means 00:00:00. Default: today 00:00:00.')
+    parser.add_argument(
+        '-t', '--dt-to', type=parse_datetime_end, metavar='DATETIME',
+        help='End of the analyzed period, inclusive (same formats). A bare date means 23:59:59. '
+             'Default: today 23:59:59.')
+    parser.add_argument(
+        '-n', '--binary-logs-file-name', default=DEFAULT_LOG_NAME, metavar='NAME',
+        help=f'Binary log base name without the numeric extension (default: {DEFAULT_LOG_NAME}).')
+    parser.add_argument(
+        '-p', '--binary-logs-file-path', type=Path, default=DEFAULT_LOG_DIR, metavar='PATH',
+        help=f'Directory containing the binary logs (default: {DEFAULT_LOG_DIR}).')
+    parser.add_argument(
+        '-o', '--output-path', type=Path, default=None, metavar='PATH',
+        help='Directory for the report files (default: current directory).')
+    parser.add_argument(
+        '-s', '--sql-operations', type=parse_operations, default=ALL_OPERATIONS, metavar='OPS',
+        help='Comma separated operations to report: all, update, insert, delete, truncate, drop '
+             '(default: all). Example: --sql-operations=update,insert')
+    parser.add_argument(
+        '-g', '--no-skip-gtid-strict-mode', action='store_true',
+        help='Never pass --skip-gtid-strict-mode to mysqlbinlog. By default it is passed only if '
+             'a MariaDB mysqlbinlog is detected (MySQL does not support it).')
+    parser.add_argument(
+        '-j', '--jobs', type=int, default=min(4, os.cpu_count() or 1), metavar='N',
+        help='Number of mysqlbinlog processes to run in parallel (default: min(4, CPU count)).')
+    parser.add_argument(
+        '--mysqlbinlog', default='mysqlbinlog', metavar='BIN',
+        help='Name or path of the mysqlbinlog executable (default: mysqlbinlog).')
+    parser.add_argument(
+        '--ignore-mtime', action='store_true',
+        help='Do not pre-select log files by modification time; rely only on mysqlbinlog\'s event '
+             'timestamps. Use this if the logs were copied/restored and their mtimes are unreliable.')
+    parser.add_argument(
+        '-q', '--write-queries', action='store_true',
+        help='Additionally write one file per operation type (<ts>_binary-logs-<op>-queries.sql) '
+             'containing the full SQL of sample queries found in the logs. Note: SELECT statements '
+             'are never written to binary logs, so they can not appear.')
+    parser.add_argument(
+        '--query-samples', type=int, default=1, metavar='N',
+        help='With --write-queries: how many example queries to keep per operation and table '
+             '(default: 1). Use 0 to write ALL queries (can produce very large files).')
+    parser.add_argument(
+        '--no-color', action='store_true', help='Disable colored output.')
+    return parser
 
-    # Check if start datetime is given in expected formats, otherwise use current day as start
-    if regexDate.match(dtFrom) or regexDateTime.match(dtFrom) or regexTimestamp.match(dtFrom):
-        try:
-            dtFrom = (datetime.datetime.strptime(dtFrom, '%Y-%m-%d')
-                      .replace(hour=0, minute=0, second=0, microsecond=0))
-        except ValueError:
-            try:
-                dtFrom = datetime.datetime.strptime(dtFrom, '%Y-%m-%d %H:%M:%S')
-            except ValueError:
-                try:
-                    dtFrom = datetime.datetime.fromtimestamp(int(dtFrom))
-                except ValueError:
-                    Printer.error('Invalid start datetime value "{}" given!'.format(dtFrom))
-                    sys.exit(1)
-    else:
-        dtFrom = startOfDay
 
-    # Check if end datetime is given in expected formats, otherwise use current day as end
-    if regexDate.match(dtTo) or regexDateTime.match(dtTo) or regexTimestamp.match(dtTo):
-        try:
-            dtToObject = (datetime.datetime.strptime(dtTo, '%Y-%m-%d')
-                          .replace(hour=0, minute=0, second=0, microsecond=0))
-            dtTo = dtToObject + datetime.timedelta(hours=23, minutes=59, seconds=59)
-        except ValueError:
-            try:
-                dtTo = datetime.datetime.strptime(dtTo, '%Y-%m-%d %H:%M:%S')
-            except ValueError:
-                try:
-                    dtTo = datetime.datetime.fromtimestamp(int(dtTo))
-                except ValueError:
-                    Printer.error('Invalid end datetime value "{}" given!'.format(dtTo))
-                    sys.exit(1)
-    else:
-        dtTo = datetime.datetime.now().replace(hour=13, minute=0, microsecond=0)
+def build_config(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Config:
+    """Validate the parsed arguments and return the final working configuration."""
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    dt_from = args.dt_from or today
+    dt_to = args.dt_to or today.replace(hour=23, minute=59, second=59)
+    if dt_from > dt_to:
+        parser.error(f'the start datetime ({dt_from:{DATETIME_FORMAT}}) must not be later than '
+                     f'the end datetime ({dt_to:{DATETIME_FORMAT}})')
 
-    if dtFrom > dtTo:
-        Printer.error(
-            'The start datetime "{}" can not be greater than the end datetime {}'
-            .format(dtTo.strftime('%Y-%m-%d %H:%M:%S'), dtFrom.strftime('%Y-%m-%d %H:%M:%S'))
-        )
-        sys.exit(1)
+    if args.jobs < 1:
+        parser.error('--jobs must be at least 1')
 
-    # If no binary log files path is given, we use the default path
-    if binaryLogsFilePath == '':
-        binaryLogsFilePath = '/var/lib/mysql/'
+    log_dir = args.binary_logs_file_path.expanduser().resolve()
+    if log_dir == Path(log_dir.anchor):
+        parser.error(f'the binary logs path "{log_dir}" can\'t be the filesystem root')
+    if not log_dir.is_dir() or not os.access(log_dir, os.R_OK | os.X_OK):
+        parser.error(f'the binary logs path "{log_dir}" does not exist or is not readable')
 
-    # Check if the given binary logs file path is the filesystem root (not allowed!)
-    if len(binaryLogsFilePath) == 1 and binaryLogsFilePath[0] == '/':
-        Printer.error('The binary logs file path "{}" can\'t be the filesystem root!'.format(binaryLogsFilePath))
-        sys.exit(1)
+    output_dir = (args.output_path or Path.cwd()).expanduser().resolve()
+    if output_dir == Path(output_dir.anchor):
+        parser.error(f'the output path "{output_dir}" can\'t be the filesystem root')
+    if not output_dir.is_dir() or not os.access(output_dir, os.W_OK | os.X_OK):
+        parser.error(f'the output path "{output_dir}" does not exist or is not writable')
 
-    # Add slash at the end of path if not exist
-    if binaryLogsFilePath[len(binaryLogsFilePath) - 1] != '/':
-        binaryLogsFilePath = binaryLogsFilePath + '/'
+    mysqlbinlog = shutil.which(args.mysqlbinlog)
+    if mysqlbinlog is None:
+        parser.error(f'"{args.mysqlbinlog}" was not found. Install the MySQL/MariaDB client tools '
+                     f'or pass --mysqlbinlog=/path/to/mysqlbinlog')
 
-    # Check if path exists and readable by current user
-    if not os.path.exists(binaryLogsFilePath) or not os.access(binaryLogsFilePath, os.R_OK):
-        Printer.error(
-            'The binary logs file path "{}" does not exist, or is not readable by the current user "{}"!'
-            .format(binaryLogsFilePath, currentUser)
-        )
-        sys.exit(1)
+    if args.query_samples < 0:
+        parser.error('--query-samples must be 0 (all) or a positive number')
 
-    # If no binary logs file name is given, we use the default file name
-    if binaryLogsFileName == '':
-        binaryLogsFileName = 'mysql-bin'
+    skip_gtid = False if args.no_skip_gtid_strict_mode else is_mariadb(mysqlbinlog)
 
-    # Output path checks
-    if outputPath == '':
-        # If path is empty, we use the current working directory as path
-        outputFilePath = os.getcwd() + '/'
-    elif outputPath[len(outputPath) - 1] != '/':
-        # Add / at the end of path if not exist
-        outputFilePath = outputPath + '/'
-    else:
-        outputFilePath = outputPath
+    return Config(
+        dt_from=dt_from, dt_to=dt_to, log_dir=log_dir, log_name=args.binary_logs_file_name,
+        output_dir=output_dir, operations=args.sql_operations, skip_gtid_strict_mode=skip_gtid,
+        jobs=args.jobs, mysqlbinlog=mysqlbinlog, ignore_mtime=args.ignore_mtime,
+        write_queries=args.write_queries, query_samples=args.query_samples)
 
-    if outputFilePath == '/':
-        Printer.error('The output path "{}" can\'t be the filesystem root!'.format(outputFilePath))
-        sys.exit(1)
 
-    if os.path.exists(outputFilePath) is False or os.access(outputFilePath, os.W_OK) is False:
-        Printer.error(
-            'The output path "{}" does not exist, or is not writable by the current user "{}"!'
-            .format(outputFilePath, currentUser)
-        )
-        sys.exit(1)
+def is_mariadb(mysqlbinlog: str) -> bool:
+    """True if the given mysqlbinlog is the MariaDB flavor (the only one that
+    knows --skip-gtid-strict-mode)."""
+    try:
+        result = subprocess.run([mysqlbinlog, '--version'], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return 'mariadb' in (result.stdout + result.stderr).lower()
 
-    if sqlOperations == '':
-        sqlOperations = 'all'
-    elif ',' in sqlOperations:
-        sqlOperations = sqlOperations.lower()
-        for operation in sqlOperations.split(','):
-            if operation not in allowedOperations:
-                Printer.error('Unknown SQL operation "{}"!'.format(operation))
-                sys.exit(1)
-    elif sqlOperations not in allowedOperations:
-        Printer.error('Unknown SQL operation "{}"!'.format(sqlOperations))
-        sys.exit(1)
 
+def print_config(cfg: Config) -> None:
     Printer.default('+---------------------------------------------------+\n'
                     '|  F I N A L   W O R K I N G   P A R A M E T E R S  |\n'
                     '+---------------------------------------------------+')
-    Printer.default('Datetime from:\t\t\t\t\t{}\n'
-                    'Datetime to:\t\t\t\t\t{}\n'
-                    'Binary logs path:\t\t\t\t{}\n'
-                    'Binary logs filename (without extension):\t{}\n'
-                    'Output path:\t\t\t\t\t{}\n'
-                    'SQL operations:\t\t\t\t\t{}\n'
-                    'Skip GTID strict mode:\t\t\t\t{}'
-                    .format(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName, outputFilePath, sqlOperations, skipGtidStrictMode))
+    Printer.default(
+        f'Datetime from:                {cfg.dt_from:{DATETIME_FORMAT}}\n'
+        f'Datetime to (inclusive):      {cfg.dt_to:{DATETIME_FORMAT}}\n'
+        f'Binary logs path:             {cfg.log_dir}\n'
+        f'Binary logs name:             {cfg.log_name}.<number>\n'
+        f'Output path:                  {cfg.output_dir}\n'
+        f'SQL operations:               {",".join(cfg.operations)}\n'
+        f'Skip GTID strict mode:        {cfg.skip_gtid_strict_mode}\n'
+        f'Parallel jobs:                {cfg.jobs}\n'
+        f'mysqlbinlog:                  {cfg.mysqlbinlog}\n'
+        f'Filter files by mtime:        {not cfg.ignore_mtime}\n'
+        f'Write sample queries:         '
+        f'{("yes (" + (str(cfg.query_samples) if cfg.query_samples else "all") + " per table)") if cfg.write_queries else "no"}')
     Printer.default('=====================================================')
 
-    return [
-        dtFrom,
-        dtTo,
-        binaryLogsFilePath,
-        binaryLogsFileName,
-        outputFilePath,
-        sqlOperations,
-        skipGtidStrictMode
-    ]
 
+# ========  LOG DISCOVERY  ========
+def find_binlogs(cfg: Config) -> List[str]:
+    """Return the binary logs that can contain events inside the time window,
+    sorted by their numeric extension.
 
-def getBinaryLogs(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName):
-    """Find all binary logs modified between dtFrom and dtTo and returns the findings in a sorted list.
-
-    Parameter
-    ---------
-    dtFrom : datetime
-        The start datetime.
-    dtTo : datetime
-        The end datetime.
-    binaryLogsFilePath : str
-        The path where the binary logs are located.
-    binaryLogsFileName : str
-        The name of the binary logs without extension.
-
-    Returns
-    -------
-    list :
-        List of matching binary logs.
+    A binlog's mtime is the time of its *last* write, so:
+      * a file whose mtime is before the window start cannot contain relevant events;
+      * the first file whose mtime is at/after the window end may still hold events
+        from inside the window (it started before the end), but every file after it
+        started later than that and can be skipped.
+    Exact filtering by event time is done by mysqlbinlog itself.
     """
+    regex = re.compile(rf'^{re.escape(cfg.log_name)}\.(\d+)$')
+    candidates = []
+    with os.scandir(cfg.log_dir) as entries:
+        for entry in entries:
+            match = regex.match(entry.name)
+            if match and entry.is_file():
+                mtime = datetime.fromtimestamp(entry.stat().st_mtime)
+                candidates.append((int(match.group(1)), entry.path, mtime))
+    candidates.sort()
+
+    if cfg.ignore_mtime:
+        return [path for _, path, _ in candidates]
+
+    selected = []
+    for _, path, mtime in candidates:
+        if mtime < cfg.dt_from:
+            continue
+        selected.append(path)
+        if mtime >= cfg.dt_to:
+            break
+    return selected
+
+
+# ========  ANALYSIS  ========
+def build_base_command(cfg: Config) -> List[str]:
+    """mysqlbinlog command without the file argument. --stop-datetime is
+    exclusive in mysqlbinlog, so one second is added to make dt_to inclusive."""
+    command = [
+        cfg.mysqlbinlog, '--base64-output=decode-rows', '-v',
+        f'--start-datetime={cfg.dt_from:{DATETIME_FORMAT}}',
+        f'--stop-datetime={cfg.dt_to + timedelta(seconds=1):{DATETIME_FORMAT}}',
+    ]
+    if cfg.skip_gtid_strict_mode:
+        command.append('--skip-gtid-strict-mode')
+    return command
+
+
+def _clean_name(name: str) -> str:
+    return name.replace('`', '')
+
+
+def _clean_statement(lines: Sequence[str]) -> str:
+    """Turn the captured statement lines into plain SQL ending with ';'."""
+    text = ''.join(lines).rstrip()
+    if text.endswith(STATEMENT_END):
+        text = text[:-len(STATEMENT_END)].rstrip()
+    return text if text.endswith(';') else text + ';'
+
+
+class _SampleWriter:
+    """Collects the sampled queries of ONE binlog in a JSON-lines temp file (one entry
+    per line), so memory use stays bounded however many queries are captured."""
+
+    def __init__(self, path: str, binlog_name: str, limit: int):
+        self.path = path
+        self.binlog_name = binlog_name
+        self.limit = limit
+        self.taken: Counter = Counter()
+        self.handle = None
+
+    def wants(self, op: str, table: str) -> bool:
+        return self.limit == 0 or self.taken[(op, table)] < self.limit
+
+    def add(self, op: str, table: str, ts: str, pos: str, body: str, kind: str,
+            original: Optional[str] = None) -> None:
+        lines = [f'-- {ts or "?"} | {self.binlog_name} @ {pos or "?"} | {table}']
+        if original:
+            lines.append('-- Original statement (Rows_query event):')
+            lines.append(original if original.endswith(';') else original + ';')
+        if kind == 'row':
+            lines.append('-- Row image as decoded by mysqlbinlog (@N = N-th column of the table):')
+            lines.append(body.rstrip('\n'))
+        else:
+            lines.append(body)
+        if self.handle is None:
+            self.handle = open(self.path, 'w', encoding='utf-8')
+        self.handle.write(json.dumps({'op': op, 'table': table, 'entry': '\n'.join(lines)}) + '\n')
+        self.taken[(op, table)] += 1
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
+def analyze_file(base_command: Sequence[str], binlog: str, operations: Sequence[str],
+                 samples_path: Optional[str] = None,
+                 samples_per_table: int = 1) -> Tuple[str, Dict[str, Counter]]:
+    """Run mysqlbinlog on one file and count operations per table while streaming
+    its stdout. If *samples_path* is given, the full SQL of up to *samples_per_table*
+    queries per operation and table (0 = all) is also written there.
+
+    Runs in a worker process, so it only takes/returns picklable data."""
+    wanted = set(operations)
+    counts = {op: Counter() for op in operations}
+    sampler = _SampleWriter(samples_path, Path(binlog).name, samples_per_table) if samples_path else None
+
+    # Parser state, only used when sampling queries.
+    last_at = ''                    # position from the last "# at N" line
+    event_ts = ''                   # timestamp of the current event
+    event_pos = ''                  # start position of the current event
+    rows_query: Optional[List[str]] = None   # original SQL of a Rows_query event
+    collecting_rows_query = False
+    row_lines: Optional[List[str]] = None    # "###" block of the row being captured
+    row_meta = None
+    stmt_lines: Optional[List[str]] = None   # statement being captured
+    stmt_meta = None
+
+    def finish_row() -> None:
+        nonlocal row_lines, row_meta
+        if row_lines is not None:
+            op, table, ts, pos, original = row_meta
+            sampler.add(op, table, ts, pos, ''.join(row_lines), 'row', original)
+        row_lines = row_meta = None
+
+    def finish_stmt() -> None:
+        nonlocal stmt_lines, stmt_meta
+        if stmt_lines is not None:
+            op, table, ts, pos = stmt_meta
+            sampler.add(op, table, ts, pos, _clean_statement(stmt_lines), 'statement')
+        stmt_lines = stmt_meta = None
+
+    with tempfile.TemporaryFile('w+', errors='replace') as stderr_file:
+        process = subprocess.Popen(
+            [*base_command, binlog],
+            stdout=subprocess.PIPE, stderr=stderr_file,
+            text=True, errors='replace', bufsize=1 << 20)
+        with process:
+            try:
+                for line in process.stdout:
+                    if sampler is not None:
+                        # Statement being captured: runs until its delimiter line.
+                        if stmt_lines is not None:
+                            if line.startswith('# at '):
+                                finish_stmt()          # unexpected end, keep what we have
+                            else:
+                                stmt_lines.append(line)
+                                if line.rstrip().endswith(STATEMENT_END):
+                                    finish_stmt()
+                                continue
+                        # A row block ends with the first line that is not a "###" line.
+                        if row_lines is not None and not line.startswith('###'):
+                            finish_row()
+                        # Text of a Rows_query event: "# <sql>" lines until "# at N".
+                        if collecting_rows_query:
+                            if line.startswith('# ') and not line.startswith('# at '):
+                                rows_query.append(line[2:].rstrip('\n'))
+                                continue
+                            collecting_rows_query = False
+
+                    if line.startswith('###'):
+                        if line[4:5] in ROW_FIRST_CHARS:
+                            match = ROW_RE.match(line)
+                            if match:
+                                if row_lines is not None:
+                                    finish_row()       # previous row of the same event
+                                op = ROW_OPERATIONS[match.group(1)]
+                                if op in wanted:
+                                    table = _clean_name(match.group(2))
+                                    counts[op][table] += 1
+                                    if sampler is not None and sampler.wants(op, table):
+                                        row_lines = [line]
+                                        row_meta = (op, table, event_ts, event_pos,
+                                                    '\n'.join(rows_query) if rows_query else None)
+                                    continue
+                        if row_lines is not None:
+                            row_lines.append(line)
+                        continue
+
+                    first = line[:1]
+                    if first == '#':
+                        if sampler is not None:
+                            if line.startswith('# at '):
+                                last_at = line[5:].strip()
+                            elif line[1:2].isdigit():
+                                match = EVENT_RE.match(line)
+                                if match:
+                                    day, clock, event_type = match.groups()
+                                    event_ts = f'20{day[0:2]}-{day[2:4]}-{day[4:6]} {clock.zfill(8)}'
+                                    event_pos = last_at
+                                    if event_type == 'Rows_query':
+                                        rows_query = []
+                                        collecting_rows_query = True
+                                    elif not event_type.startswith(ROW_EVENT_PREFIXES):
+                                        rows_query = None
+                        continue
+
+                    if first in STATEMENT_FIRST_CHARS:
+                        keyword = line.split(None, 1)[0].lower()
+                        if keyword in wanted:
+                            match = STATEMENT_RES[keyword].match(line)
+                            if match:
+                                table = _clean_name(match.group(1))
+                                counts[keyword][table] += 1
+                                if sampler is not None and sampler.wants(keyword, table):
+                                    stmt_lines = [line]
+                                    stmt_meta = (keyword, table, event_ts, event_pos)
+                                    if line.rstrip().endswith(STATEMENT_END):
+                                        finish_stmt()
+
+                if sampler is not None:
+                    finish_stmt()
+                    finish_row()
+            finally:
+                if sampler is not None:
+                    sampler.close()
+
+        if process.returncode != 0:
+            stderr_file.seek(0)
+            # Drop warnings that are expected when the window extends past the end of a
+            # file; some mysqlbinlog versions exit non-zero for them although all events
+            # were printed. Anything else is a real failure.
+            lines = [line.strip() for line in stderr_file.read().splitlines() if line.strip()]
+            problems = [line for line in lines if not BENIGN_STDERR_RE.match(line)]
+            if problems or not lines:
+                message = '\n'.join(problems) or f'mysqlbinlog exited with code {process.returncode}'
+                raise BinlogAnalysisError(f'{binlog}: {message}')
+
+    return binlog, counts
+
+
+def analyze_all(cfg: Config, binlogs: Sequence[str],
+                samples_dir: Optional[str] = None) -> Dict[str, Counter]:
+    """Analyze all logs (in parallel if cfg.jobs > 1) and merge the counters. With
+    *samples_dir*, each worker also writes its sampled queries to <samples_dir>/<index>.jsonl."""
+    base_command = build_base_command(cfg)
+    total = {op: Counter() for op in cfg.operations}
+    done = 0
+
+    def samples_path(index: int) -> Optional[str]:
+        return os.path.join(samples_dir, f'{index}.jsonl') if samples_dir else None
+
+    def merge(path: str, counts: Dict[str, Counter]) -> None:
+        nonlocal done
+        done += 1
+        for op, counter in counts.items():
+            total[op].update(counter)
+        Printer.tool(f'  [{done}/{len(binlogs)}] {Path(path).name}')
+
+    workers = min(cfg.jobs, len(binlogs))
+    if workers <= 1:
+        for index, binlog in enumerate(binlogs):
+            merge(*analyze_file(base_command, binlog, cfg.operations,
+                                samples_path(index), cfg.query_samples))
+        return total
+
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(analyze_file, base_command, b, cfg.operations,
+                               samples_path(i), cfg.query_samples)
+                   for i, b in enumerate(binlogs)]
+        try:
+            for future in as_completed(futures):
+                merge(*future.result())
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    return total
+
+
+# ========  OUTPUT FILES  ========
+def _open_private(path: Path):
+    """Open a new text file for writing with 0600 permissions (reports contain
+    table names and may be sensitive)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    return os.fdopen(fd, 'w', encoding='utf-8', errors='replace')
+
+
+def write_file_list(binlogs: Sequence[str], path: Path) -> None:
+    with _open_private(path) as handle:
+        handle.write('\n'.join(binlogs) + '\n')
+
+
+def write_report(counts: Dict[str, Counter], cfg: Config, binlogs: Sequence[str], path: Path) -> None:
+    with _open_private(path) as handle:
+        handle.write(
+            f'Binary logs report\n'
+            f'Period:       {cfg.dt_from:{DATETIME_FORMAT}} - {cfg.dt_to:{DATETIME_FORMAT}}\n'
+            f'Log files:    {len(binlogs)}\n'
+            f'Generated at: {datetime.now():{DATETIME_FORMAT}}\n\n')
+        for op in cfg.operations:
+            counter = counts[op]
+            title = f'{op.upper()} Operations (total: {sum(counter.values())})'
+            handle.write(f'{title}\n{"=" * 30}\n')
+            if not counter:
+                handle.write('  (none)\n')
+            for table, number in sorted(counter.items(), key=lambda item: (-item[1], item[0])):
+                handle.write(f'{number:>12}  {table}\n')
+            handle.write('\n')
+
+
+def write_query_files(cfg: Config, binlogs: Sequence[str], samples_dir: str,
+                      stamp: str) -> Dict[str, Path]:
+    """Merge the per-binlog sample files (in log order) into one SQL file per operation,
+    applying the per-table limit across all logs. Streams, so memory stays bounded."""
+    paths = {op: cfg.output_dir / f'{stamp}_binary-logs-{op}-queries.sql' for op in cfg.operations}
+    limit_text = f'{cfg.query_samples} per table' if cfg.query_samples else 'all queries'
+    taken: Counter = Counter()
+    handles = {}
+    try:
+        for op, path in paths.items():
+            handle = _open_private(path)
+            handles[op] = handle
+            handle.write(
+                f'-- {op.upper()} queries found in the binary logs\n'
+                f'-- Period:  {cfg.dt_from:{DATETIME_FORMAT}} - {cfg.dt_to:{DATETIME_FORMAT}}\n'
+                f'-- Samples: {limit_text}\n'
+                f'-- Each entry: <event time> | <binlog> @ <position> | <table>\n\n')
+        for index in range(len(binlogs)):
+            sample_file = Path(samples_dir) / f'{index}.jsonl'
+            if not sample_file.exists():
+                continue
+            with open(sample_file, encoding='utf-8') as source:
+                for raw in source:
+                    record = json.loads(raw)
+                    key = (record['op'], record['table'])
+                    if cfg.query_samples and taken[key] >= cfg.query_samples:
+                        continue
+                    taken[key] += 1
+                    handles[record['op']].write(record['entry'] + '\n\n')
+    finally:
+        for handle in handles.values():
+            handle.close()
+    return paths
+
+
+# ========  MAIN LOGIC  ========
+def run(cfg: Config) -> int:
+    print_config(cfg)
 
     Printer.tool('Searching for matching binary logs ...')
-    binaryLogs = []
-    # Regex pattern for ^<filename>.<number>$
-    regex = re.compile(r'^' + re.escape(binaryLogsFileName) + r'\.[0-9]*$')
+    binlogs = find_binlogs(cfg)
+    if not binlogs:
+        Printer.warning('No matching binary log files found! Nothing to do.')
+        return 0
+    Printer.default(f'Found {len(binlogs)} binary log file(s).')
 
-    # Getting all matching binary logs
-    for root, dirs, files in os.walk(binaryLogsFilePath):
-        for file in files:
-            if regex.match(file):
-                fileWithPath = root + file
-                if dtFrom <= getModifiedDateTime(fileWithPath) <= dtTo:
-                    binaryLogs.append(fileWithPath)
+    stamp = f'{datetime.now():%Y-%m-%d}_{int(time.time())}'
+    report_file = cfg.output_dir / f'{stamp}_binary-logs-report.txt'
+    list_file = cfg.output_dir / f'{stamp}_binary-logs-list.txt'
 
-    if not binaryLogs:
-        Printer.warning('No matching binary log files found! Abort script execution.', prefix=False)
-        sys.exit(0)
-
-    # Return sorted list
-    return sorted(binaryLogs)
-
-
-def writeFileList(binaryLogs, outputFile):
-    """Writes the matching binary log file names (incl. path) to a file.
-
-    Parameter
-    ---------
-    binaryLogs : list[str]
-        List with the matching binary log filenames (incl. path).
-    outputFile : str
-        Filename (incl. patch) to where to write the list of files.
-    """
-
-    Printer.tool('Writing list of binary logs found to ' + outputFile + ' ... ', endNewline=False)
+    # Private scratch directory (0700) for the sampled queries; always removed again.
+    samples_dir = (tempfile.mkdtemp(prefix='.binlog-queries-', dir=cfg.output_dir)
+                   if cfg.write_queries else None)
     try:
-        with open(outputFile, 'w') as txtFile:
-            for line in binaryLogs:
-                txtFile.write(line + '\n')
-        txtFile.close()
-        Printer.success('Done.')
-    except IOError as e:
-        Printer.error('Can\'t write to "{}"! {}'.format(outputFile, e.strerror), startNewline=True)
-        sys.exit(1)
+        Printer.tool(f'Analyzing binary logs with {min(cfg.jobs, len(binlogs))} worker(s) ...')
+        started = time.monotonic()
+        counts = analyze_all(cfg, binlogs, samples_dir)
+        Printer.default(f'Analysis finished in {time.monotonic() - started:.1f}s.')
 
-
-def createReport(rawLog, reportFile, sqlOperations):
-    """Reads the previously created combined binary logs file (mysql-raw.out), look up and count UPDATE, INSERT and
-    DELETE operations, and writes the result to the report file (binary-logs-report.txt).
-
-    Parameter
-    ---------
-    rawLog : str
-        Combined RAW binary log file (created by decodeAndCombineBinaryLogFiles())
-    reportFile: str
-        File to where the report shall be written.
-    sqlOperations: str
-        Comma separated list of SQL operations to be included in the report.
-        Possible values: all, select, insert, update, delete, drop, truncate
-    """
-
-    Printer.tool('Begin analyzing combined binary logs file and create report ...')
-    if not os.access(rawLog, os.R_OK):
-        Printer.error('File {} is not readable by current user {}!'.format(rawLog, getpass.getuser()))
-        sys.exit(1)
-    with open(reportFile, 'w') as reportFileHandle:
-        if any(ele in sqlOperations for ele in ['all', 'update']):
-            Printer.default(
-                'Look up and count UPDATE operations, and add result to the report file ... ',
-                endNewline=False
-            )
-            try:
-                reportFileHandle.write('UPDATE Operations\n==============================\n')
-                reportFileHandle.flush()
-                subprocess.run(
-                    'cat "' + rawLog + '" | grep -E "^(UPDATE|### UPDATE)" | sort | uniq -c',
-                    check=True,
-                    shell=True,
-                    stdout=reportFileHandle,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True
-                )
-            except subprocess.CalledProcessError as e:
-                Printer.error('Failed!\n{}'.format(e.stderr.replace('\n', '')), prefix=False)
-                sys.exit(1)
-            else:
-                Printer.success('Done.')
-                reportFileHandle.flush()
-
-        if any(ele in sqlOperations for ele in ['all', 'insert']):
-            Printer.default(
-                'Look up and count INSERT operations, and add result to the report file ... ',
-                endNewline=False
-            )
-            try:
-                reportFileHandle.write('\nINSERT Operations\n==============================\n')
-                reportFileHandle.flush()
-                subprocess.run(
-                    'cat ' + rawLog + ' | grep -E "^(INSERT|### INSERT)" | sort | uniq -c',
-                    check=True,
-                    shell=True,
-                    stdout=reportFileHandle,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True
-                )
-            except subprocess.CalledProcessError as e:
-                Printer.error('Failed!\n{}'.format(e.stderr.replace('\n', '')), prefix=False)
-                sys.exit(1)
-            else:
-                Printer.success('Done.')
-                reportFileHandle.flush()
-
-        if any(ele in sqlOperations for ele in ['all', 'delete']):
-            Printer.default(
-                'Look up and count DELETE operations, and add result to the report file ... ',
-                endNewline=False
-            )
-            try:
-                reportFileHandle.write('\nDELETE Operations\n==============================\n')
-                reportFileHandle.flush()
-                subprocess.run(
-                    'cat ' + rawLog + ' | grep -E "^(DELETE|### DELETE)" | sort | uniq -c',
-                    check=True,
-                    shell=True,
-                    stdout=reportFileHandle,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True
-                )
-            except subprocess.CalledProcessError as e:
-                Printer.error('Failed!\n{}'.format(e.stderr.replace('\n', '')), prefix=False)
-                sys.exit(1)
-            else:
-                Printer.success('Done.')
-                reportFileHandle.flush()
-
-        if any(ele in sqlOperations for ele in ['all', 'truncate']):
-            Printer.default(
-                'Look up and count TRUNCATE operations, and add result to the report file ... ',
-                endNewline=False
-            )
-            try:
-                reportFileHandle.write('\nTRUNCATE Operations\n==============================\n')
-                reportFileHandle.flush()
-                subprocess.run(
-                    'cat ' + rawLog + ' | grep -E "^(TRUNCATE|### TRUNCATE)" | sort | uniq -c',
-                    check=True,
-                    shell=True,
-                    stdout=reportFileHandle,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True
-                )
-            except subprocess.CalledProcessError as e:
-                Printer.error('Failed!\n{}'.format(e.stderr.replace('\n', '')), prefix=False)
-                sys.exit(1)
-            else:
-                Printer.success('Done.')
-                reportFileHandle.flush()
-
-        if any(ele in sqlOperations for ele in ['all', 'drop']):
-            Printer.default(
-                'Look up and count DROP operations, and add result to the report file ... ',
-                endNewline=False
-            )
-            try:
-                reportFileHandle.write('\nDROP Operations\n==============================\n')
-                reportFileHandle.flush()
-                subprocess.run(
-                    'cat ' + rawLog + ' | grep -E "^(DROP|### DROP)" | sort | uniq -c',
-                    check=True,
-                    shell=True,
-                    stdout=reportFileHandle,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True
-                )
-            except subprocess.CalledProcessError as e:
-                Printer.error('Failed!\n{}'.format(e.stderr.replace('\n', '')), prefix=False)
-                sys.exit(1)
-            else:
-                Printer.success('Done.')
-                reportFileHandle.flush()
-
-    reportFileHandle.close()
-
-
-def removeRawLogAndPrintFinalMessage(rawLog):
-    """Deletes the combined raw binary log file
-
-    Parameter
-    ---------
-    rawLog : str
-        Combined RAW binary log file (created by decodeAndCombineBinaryLogFiles())
-    """
-
-    Printer.tool('Deleting combined raw log file ... ', endNewline=False)
-    try:
-        os.unlink(rawLog)
-    except OSError as e:
-        Printer.error('Failed!\n{}'.format(e.strerror), prefix=False)
-    else:
-        Printer.success('Done.')
-
-
-def createOutputFiles(rawLog: str, reportFile: str, fileListFile: str):
-    try:
-        Printer.default('Create RAW log file ...    ', endNewline=False)
-        with open(rawLog, 'w') as fp:
-            pass
-        Printer.success('OK')
-    except OSError as e:
-        Printer.error('Failed!\n{}'.format(e.strerror), prefix=False)
-        sys.exit(1)
-
-    try:
-        Printer.default('Create report file ...     ', endNewline=False)
-        with open(reportFile, 'w') as fp:
-            pass
-        Printer.success('OK')
-    except OSError as e:
-        Printer.error('Failed!\n{}'.format(e.strerror), prefix=False)
-        sys.exit(1)
-
-    try:
-        Printer.default('Create file list file ...  ', endNewline=False)
-        with open(fileListFile, 'w') as fp:
-            pass
-        Printer.success('OK')
-    except OSError as e:
-        Printer.error('Failed!\n{}'.format(e.strerror), prefix=False)
-        sys.exit(1)
-
-
-def run(dtFrom: str, dtTo: str, binaryLogsFilePath: str, binaryLogsFileName: str, outputPath: str, sqlOperations: str, skipGtidStrictMode: bool):
-    """Wrapper method which calls other methods
-
-    Parameters
-    ----------
-    dtFrom : str
-        The start date/datetime/timestamp. Allowed formats: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, Unix timestamp
-    dtTo : str
-        The end date/datetime/timestamp.  Allowed formats: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, Unix timestamp
-    binaryLogsFilePath : str
-        The path where the binary logs file are located. (default: /var/lib/mysql)
-    binaryLogsFileName : str
-        The name of the binary log files without extension. (default: binlog)
-    outputPath : str
-        The path where the output files shall be saved. (default: /var/lib/mysql)
-    sqlOperations : str
-        The SQL operations which should be taken into the report (default: all)
-    skipGtidStrictMode : bool
-        Enable/Disable the mysqlbinlog argument '--skipGtidStrictMode'
-    """
-
-    params = checkWorkingParameters(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName, outputPath, sqlOperations, skipGtidStrictMode)
-
-    currentDate = datetime.date.today().strftime('%Y-%m-%d')
-    currentTimeStamp = str(int(time.time()))
-
-    rawLogFile = params[4] + 'mysql-raw.log'
-    reportFile = params[4] + currentDate + '_' + currentTimeStamp + '_binary-logs-report.txt'
-    fileListFile = params[4] + currentDate + '_' + currentTimeStamp + '_binary-logs-list.txt'
-
-    createOutputFiles(rawLogFile, reportFile, fileListFile)
-
-    binaryLogs = getBinaryLogs(params[0], params[1], params[2], params[3])
-
-    writeFileList(binaryLogs, fileListFile)
-    decodeAndCombineBinaryLogs(rawLogFile, binaryLogs, skipGtidStrictMode)
-    createReport(rawLogFile, reportFile, params[5])
-    removeRawLogAndPrintFinalMessage(rawLogFile)
+        Printer.tool('Writing output files ...')
+        write_file_list(binlogs, list_file)
+        write_report(counts, cfg, binlogs, report_file)
+        query_files = write_query_files(cfg, binlogs, samples_dir, stamp) if samples_dir else {}
+    finally:
+        if samples_dir:
+            shutil.rmtree(samples_dir, ignore_errors=True)
 
     Printer.success('All operations successfully executed!')
-    Printer.default('Matched binary log files list: ' + fileListFile)
-    Printer.default('Generated report file: ' + reportFile + '\n')
+    Printer.default(f'Matched binary log files list: {list_file}')
+    Printer.default(f'Generated report file:        {report_file}')
+    for op, path in query_files.items():
+        Printer.default(f'{op.upper() + " queries:":<30}{path}')
+    Printer.default('')
+    return 0
 
-# ========  END OF FUNCTIONS  ========
 
-
-# ======== MAIN LOGIC ========
-def main(argv):
-    """Defines some default values for the working parameters, contains the logic for options and help, and shows the
-    initial working parameters."""
-
-    dtFrom = ''
-    dtTo = ''
-    binaryLogsFileName = ''
-    binaryLogsFilePath = ''
-    outputPath = ''
-    sqlOperations = ''
-    tmpSkipGtidStrictMode = ''
-
-    opts, args = getopt.getopt(
-        argv,
-        'hf:t:n:p:o:s:g',
-        [
-            'dt-from=',
-            'dt-to=',
-            'binary-logs-file-name=',
-            'binary-logs-file-path=',
-            'output-file=',
-            'sql-operations=',
-            'skip-gtid-Strict-Mode'
-        ]
-    )
-
-    for opt, arg in opts:
-        if opt == '-h':
-            Printer.default('USAGE: analyze-mysql-binlogs-queries --dt-from=<datetime> --dt-end=<datetime> '
-                            '--binary-logs-file-name=<file-name-without-extension> --binary-logs-file-path=<path> '
-                            '--output-path=<output-path> --sql-operations=<operations>')
-            Printer.default('-h\t\t\t\t\t\tShows this help')
-            Printer.default('-f\t--dt-from=<datetime>\t\t\tThe start date(time) the binary logs are created to '
-                            'analyze (allowed formats: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, Unix timestamp)')
-            Printer.default('\t\t\t\t\t\tIf given as YYYY-MM-DD, then the start datetime will be: YYYY-MM-DD 00:00:00.')
-            Printer.default('\t\t\t\t\t\tIf omitted, the start datetime will be the current date at 00:00:00.')
-            Printer.default('-t\t--dt-to=<datetime>\t\t\tThe end date(time) the binary logs are created to analyze ('
-                            'allowed formats: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, Unix timestamp)')
-            Printer.default('\t\t\t\t\t\tIf given as YYYY-MM-DD, then the end datetime will be: YYYY-MM-DD 23:59:59')
-            Printer.default('\t\t\t\t\t\tIf omitted, the end datetime will be the current date at 23:59:59.')
-            Printer.default('-n\t--binary-logs-file-name=<name>\t\tThe name the MySQL binary log files without the '
-                            'file extension (default: mysql-bin)')
-            Printer.default('-p\t--binary-logs-file-path=<path>\t\tThe path where the MySQL binary logs are (default: '
-                            '/var/lib/mysql/)')
-            Printer.default('-o\t--output-path=<output-path>\t\tThe path where the output files are saved (default: '
-                            '<current-directory>)')
-            Printer.default('-s\t--sql-operations=<operations>\t\tThe SQL operations which shall be included in the '
-                            'report (default: all)')
-            Printer.default('\t\t\t\t\t\tMultiple types should be separated by comma. '
-                            'Example: --sql-operations=update,insert,delete')
-            Printer.default('-g\t--no-skip-gtid-strict-mode\t\tDisable mysqlbinlog option --skip-gtid-strict-mode '
-                            '(argument is enabled by default)')
-            sys.exit()
-        elif opt in ('-f', '--dt-from'):
-            dtFrom = arg
-        elif opt in ('-t', '--dt-to'):
-            dtTo = arg
-        elif opt in ('-n', '--binary-logs-file-name'):
-            binaryLogsFileName = arg
-        elif opt in ('-p', '--binary-logs-file-path'):
-            binaryLogsFilePath = arg
-        elif opt in ('-o', '--output-path'):
-            outputPath = arg
-        elif opt in ('-s', '--sql-operations'):
-            sqlOperations = arg
-        elif opt in ('-g', '--no-skip-gtid-strict-mode'):
-            tmpSkipGtidStrictMode = 'False'
-
-    if tmpSkipGtidStrictMode == 'False':
-        skipGtidStrictMode = False
-    else:
-        skipGtidStrictMode = True
-
-    Printer.default('+---------------------------------------------------+\n'
-                    '|  G I V E N   W O R K I N G   P A R A M E T E R S  |\n'
-                    '+---------------------------------------------------+')
-    Printer.default('Datetime from:\t\t\t\t\t{}\n'
-                    'Datetime to:\t\t\t\t\t{}\n'
-                    'Binary logs path:\t\t\t\t{}\n'
-                    'Binary logs filename (without extension):\t{}\n'
-                    'Output path:\t\t\t\t\t{}\n'
-                    'SQL operations:\t\t\t\t\t{}\n'
-                    'Skip GTID strict mode:\t\t\t\t{}'
-                    .format(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName, outputPath, sqlOperations,
-                            tmpSkipGtidStrictMode))
-    Printer.default('=====================================================')
-
-    run(dtFrom, dtTo, binaryLogsFilePath, binaryLogsFileName, outputPath, sqlOperations, skipGtidStrictMode)
-# ======== END MAIN LOGIC ========
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.no_color:
+        Printer.color_enabled = False
+    cfg = build_config(args, parser)
+    try:
+        return run(cfg)
+    except BinlogAnalysisError as exc:
+        Printer.error(f'mysqlbinlog failed for {exc}')
+        return 1
+    except OSError as exc:
+        Printer.error(f'{exc.strerror or exc}: {getattr(exc, "filename", "") or ""}'.rstrip(': '))
+        return 1
+    except KeyboardInterrupt:
+        Printer.warning('Interrupted.')
+        return 130
 
 
 if __name__ == '__main__':
-    main(sys.argv[1:])
+    sys.exit(main())
