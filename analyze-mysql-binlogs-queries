@@ -272,8 +272,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '-v', '--version',
         action='version',
-        version=f'%(prog)s {SCRIPT_VERSION}',
-        help='Show the script version and exit.'
+        version=f'MySQL/MariaDB Binary Log Analyzer v{SCRIPT_VERSION}',
+        help='Show the tool name and version.'
     )
     return parser
 
