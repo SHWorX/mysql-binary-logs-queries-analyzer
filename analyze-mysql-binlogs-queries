@@ -24,18 +24,29 @@ How it works
    counting INSERT / UPDATE / DELETE / TRUNCATE / DROP operations per table in
    a single pass. Nothing decoded is ever written to disk.
 3. Merge the per-file counters and write a report plus a list of analyzed logs.
-4. Optionally (--write-queries) also collect sample SQL queries per operation and table
-   and write them to one file per operation type.
+4. Optionally (--write-queries) also collect sample SQL queries per operation and
+   table and write them to one file per operation type.
+
+Optional GUI
+------------
+Started with ``--gui`` the tool opens a small tkinter window instead of
+running on the command line. ``tkinter`` is imported only in that case, so the normal
+command line mode does not depend on it. Any other options given together with
+``--gui`` are used as the initial values of the form.
 """
 
 import argparse
 import json
 import os
+import queue
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -45,10 +56,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 # ========  CONSTANTS  ========
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
+SCRIPT_PATH = os.path.abspath(__file__)
 ALL_OPERATIONS = ('update', 'insert', 'delete', 'truncate', 'drop')
 DEFAULT_LOG_DIR = Path('/var/lib/mysql')
 DEFAULT_LOG_NAME = 'mysql-bin'
+DEFAULT_MYSQLBINLOG = '/usr/bin/mysqlbinlog'
 DATETIME_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 # Row-based events (mysqlbinlog -v), example: "### INSERT INTO `db`.`tbl`"
@@ -81,6 +94,10 @@ EVENT_RE = re.compile(
     r'^#(\d{6})\s+(\d{1,2}:\d{2}:\d{2})\s+server id \d+\s+end_log_pos \d+'
     r'(?:\s+CRC32 0x[0-9a-fA-F]+)?\s+(\w+)')
 ROW_EVENT_PREFIXES = ('Table_map', 'Write_rows', 'Update_rows', 'Delete_rows')
+
+# Lines of this tool's own console output that the GUI picks up while the analysis is running.
+PROGRESS_RE = re.compile(r'^\s*\[(\d+)/(\d+)\]')
+REPORT_LINE_RE = re.compile(r'^Generated report file:\s+(.+?)\s*$')
 
 
 # ========  OUTPUT  ========
@@ -244,9 +261,9 @@ def build_parser() -> argparse.ArgumentParser:
         help='Number of mysqlbinlog processes to run in parallel (default: min(4, CPU count)).')
     parser.add_argument(
         '--mysqlbinlog',
-        default='mysqlbinlog',
+        default=DEFAULT_MYSQLBINLOG,
         metavar='BIN',
-        help='Name or path of the mysqlbinlog executable (default: mysqlbinlog).')
+        help='Name or path of the mysqlbinlog executable (default: {DEFAULT_MYSQLBINLOG}).')
     parser.add_argument(
         '--ignore-mtime',
         action='store_true',
@@ -269,6 +286,13 @@ def build_parser() -> argparse.ArgumentParser:
         '--no-color',
         action='store_true',
         help='Disable colored output.')
+    parser.add_argument(
+        '-gui', '--gui',
+        dest='gui',
+        action='store_true',
+        help='Start the optional graphical user interface instead of running on the command line '
+             '(requires the Python module "tkinter"). All other options given here are used as '
+             'the initial values of the form.')
     parser.add_argument(
         '-v', '--version',
         action='version',
@@ -683,6 +707,492 @@ def write_query_files(cfg: Config, binlogs: Sequence[str], samples_dir: str,
     return paths
 
 
+# ========  OPTIONAL GUI (tkinter)  ========
+# tkinter is imported lazily by load_tkinter() and only when --gui is used, so the command
+# line mode never depends on it. These placeholders are filled in by load_tkinter().
+tk = ttk = filedialog = messagebox = scrolledtext = None
+
+TKINTER_MISSING_MESSAGE = (
+    'The GUI requires the Python module "tkinter", which is not installed or not available.\n'
+    'Install it first, for example:\n'
+    '  Debian/Ubuntu:    sudo apt install python3-tk\n'
+    '  Fedora/RHEL:      sudo dnf install python3-tkinter\n'
+    '  openSUSE:         sudo zypper install python3-tk\n'
+    '  Arch Linux:       sudo pacman -S tk\n'
+    '  macOS (Homebrew): brew install python-tk\n'
+    'Without "--gui" the tool keeps working on the command line.')
+
+
+def load_tkinter() -> bool:
+    """Import tkinter on demand. Returns False if it is not installed/usable."""
+    global tk, ttk, filedialog, messagebox, scrolledtext
+    try:
+        import tkinter
+        from tkinter import filedialog as _filedialog
+        from tkinter import messagebox as _messagebox
+        from tkinter import scrolledtext as _scrolledtext
+        from tkinter import ttk as _ttk
+    except ImportError:
+        return False
+    tk, ttk, filedialog, messagebox, scrolledtext = tkinter, _ttk, _filedialog, _messagebox, _scrolledtext
+    return True
+
+
+class BinlogGui:
+    """Small tkinter front end for the analyzer.
+
+    It does not analyze anything itself: it turns the form into command line options,
+    runs this very script with them as a child process and shows the output live. That
+    keeps the GUI and the command line mode identical (same validation, same results)
+    and lets "Cancel" behave exactly like pressing Ctrl+C in a terminal.
+    """
+
+    POLL_MS = 100
+    LOG_COLORS = {'error': '#c0392b', 'warning': '#b9770e', 'success': '#1e8449', 'tool': '#1f618d'}
+
+    def __init__(self, args: argparse.Namespace):
+        self.root = tk.Tk()
+        self.root.title(f'MySQL/MariaDB Binary Log Analyzer v{SCRIPT_VERSION}')
+        self.root.minsize(780, 720)
+
+        self.process: Optional[subprocess.Popen] = None
+        self.cancelled = False
+        self.report_path: Optional[str] = None
+        self.messages: queue.Queue = queue.Queue()
+        self.inputs: list = []  # widgets that are locked while an analysis is running
+
+        self._create_variables(args)
+        self._create_widgets()
+        for var in self._variables():
+            var.trace_add('write', self._on_change)
+        self._on_change()
+
+        self.root.protocol('WM_DELETE_WINDOW', self.on_close)
+        self.root.after(self.POLL_MS, self._poll)
+
+    def mainloop(self) -> int:
+        self.root.mainloop()
+        return 0
+
+    # ----  form  ----
+    def _create_variables(self, args: argparse.Namespace) -> None:
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        dt_from = args.dt_from or today
+        dt_to = args.dt_to or today.replace(hour=23, minute=59, second=59)
+
+        self.v_from = tk.StringVar(value=f'{dt_from:{DATETIME_FORMAT}}')
+        self.v_to = tk.StringVar(value=f'{dt_to:{DATETIME_FORMAT}}')
+        self.v_log_dir = tk.StringVar(value=str(args.binary_logs_file_path))
+        self.v_log_name = tk.StringVar(value=args.binary_logs_file_name)
+        self.v_output = tk.StringVar(value=str(args.output_path or Path.cwd()))
+        self.v_ops = {op: tk.BooleanVar(value=op in args.sql_operations) for op in ALL_OPERATIONS}
+        self.v_jobs = tk.StringVar(value=str(args.jobs))
+        self.v_mysqlbinlog = tk.StringVar(value=args.mysqlbinlog)
+        self.v_ignore_mtime = tk.BooleanVar(value=args.ignore_mtime)
+        self.v_no_skip_gtid = tk.BooleanVar(value=args.no_skip_gtid_strict_mode)
+        self.v_write_queries = tk.BooleanVar(value=args.write_queries)
+        self.v_samples = tk.StringVar(value=str(args.query_samples))
+        self.v_preview = tk.StringVar()
+        self.v_status = tk.StringVar(value='Ready.')
+
+    def _variables(self) -> list:
+        return [self.v_from, self.v_to, self.v_log_dir, self.v_log_name, self.v_output,
+                *self.v_ops.values(), self.v_jobs, self.v_mysqlbinlog, self.v_ignore_mtime,
+                self.v_no_skip_gtid, self.v_write_queries, self.v_samples]
+
+    def _create_widgets(self) -> None:
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        mainWindow = ttk.Frame(self.root, padding=10)
+        mainWindow.grid(row=0, column=0, sticky='nsew')
+        mainWindow.columnconfigure(0, weight=1)
+        mainWindow.rowconfigure(6, weight=1)  # the log grows with the window
+
+        period = self._group(mainWindow, 0, 'Period  (YYYY-MM-DD, YYYY-MM-DD HH:MM:SS or Unix timestamp)')
+        self._entry(period, 0, 'From:', self.v_from)
+        self._entry(period, 1, 'To (inclusive):', self.v_to)
+
+        logs = self._group(mainWindow, 1, 'Binary logs')
+        self._entry(logs, 0, 'Directory:', self.v_log_dir, self._browse_dir(self.v_log_dir))
+        self._entry(logs, 1, 'Base name:', self.v_log_name)
+
+        output = self._group(mainWindow, 2, 'Output')
+        self._entry(output, 0, 'Report directory:', self.v_output, self._browse_dir(self.v_output))
+
+        operations = self._group(mainWindow, 3, 'SQL operations')
+        for column, op in enumerate(ALL_OPERATIONS):
+            box = ttk.Checkbutton(operations, text=op.upper(), variable=self.v_ops[op])
+            box.grid(row=0, column=column, sticky='w', padx=(0, 18))
+            self.inputs.append(box)
+
+        options = self._group(mainWindow, 4, 'Options')
+        ttk.Label(options, text='Parallel jobs:').grid(row=0, column=0, sticky='w', padx=(0, 8), pady=2)
+        jobs = ttk.Spinbox(options, from_=1, to=256, width=6, textvariable=self.v_jobs)
+        jobs.grid(row=0, column=1, sticky='w', pady=2)
+        self.inputs.append(jobs)
+        self._entry(options, 1, 'mysqlbinlog:', self.v_mysqlbinlog, self._browse_file(self.v_mysqlbinlog))
+
+        flags = ttk.Frame(options)
+        flags.grid(row=2, column=0, columnspan=3, sticky='w', pady=(4, 0))
+        ignore_mtime = ttk.Checkbutton(
+            flags,
+            text='Ignore file modification times (--ignore-mtime)',
+            variable=self.v_ignore_mtime
+        )
+        ignore_mtime.grid(row=0, column=0, sticky='w')
+        no_skip_gtid = ttk.Checkbutton(
+            flags,
+            text='Never pass --skip-gtid-strict-mode to mysqlbinlog (--no-skip-gtid-strict-mode)',
+            variable=self.v_no_skip_gtid
+        )
+        no_skip_gtid.grid(row=1, column=0, sticky='w')
+
+        ttk.Label(
+            flags,
+            text='Note: --skip-gtid-strict-mode is a MariaDB specific mysqlbinlog option and does not '
+                 'exist in MySQL\'s mysqlbinlog.',
+            foreground='red'
+        ).grid(row=2, column=0, sticky='w', padx=(15, 0))
+        queries = ttk.Frame(flags)
+        queries.grid(row=3, column=0, sticky='w')
+        write_queries = ttk.Checkbutton(
+            queries,
+            text='Write sample queries (--write-queries)',
+            variable=self.v_write_queries
+        )
+        write_queries.grid(row=0, column=0, sticky='w')
+        ttk.Label(queries, text='     Samples per table (0 = all):').grid(row=0, column=1, sticky='w')
+        self.samples_spin = ttk.Spinbox(queries, from_=0, to=1000000, width=8, textvariable=self.v_samples)
+        self.samples_spin.grid(row=0, column=2, sticky='w', padx=(6, 0))
+        self.inputs += [ignore_mtime, no_skip_gtid, write_queries, self.samples_spin]
+
+        bar = ttk.Frame(mainWindow)
+        bar.grid(row=5, column=0, sticky='ew', pady=(10, 0))
+        bar.columnconfigure(1, weight=1)
+        ttk.Label(bar, text='Command:').grid(row=0, column=0, sticky='w', padx=(0, 8))
+        ttk.Entry(bar, textvariable=self.v_preview, state='readonly').grid(row=0, column=1, sticky='ew')
+        ttk.Button(bar, text='Copy', command=self._copy_command).grid(row=0, column=2, padx=(6, 0))
+
+        buttons = ttk.Frame(bar)
+        buttons.grid(row=1, column=0, columnspan=3, sticky='ew', pady=(20, 0))
+        self.start_button = ttk.Button(buttons, text='Start analysis', command=self.start)
+        self.cancel_button = ttk.Button(buttons, text='Cancel', command=self.cancel)
+        self.clear_button = ttk.Button(buttons, text='Clear log', command=self.clear_log)
+        self.report_button = ttk.Button(buttons, text='Show report', command=self.show_report)
+        for button in (self.start_button, self.cancel_button, self.clear_button, self.report_button):
+            button.pack(side='left', padx=(0, 6))
+        ttk.Button(buttons, text='Quit', command=self.on_close).pack(side='right')
+
+        self.log = scrolledtext.ScrolledText(mainWindow, height=14, wrap='word', state='disabled', font='TkFixedFont')
+        self.log.grid(row=6, column=0, sticky='nsew', pady=(10, 0))
+        for tag, color in self.LOG_COLORS.items():
+            self.log.tag_configure(tag, foreground=color)
+
+        status = ttk.Frame(mainWindow)
+        status.grid(row=7, column=0, sticky='ew', pady=(8, 0))
+        status.columnconfigure(0, weight=1)
+        ttk.Label(status, textvariable=self.v_status).grid(row=0, column=0, sticky='w')
+        self.progress = ttk.Progressbar(status, length=220, mode='determinate')
+        self.progress.grid(row=0, column=1, sticky='e')
+
+    @staticmethod
+    def _group(parent, row: int, title: str):
+        frame = ttk.LabelFrame(parent, text=title, padding=(10, 6))
+        frame.grid(row=row, column=0, sticky='ew', pady=(0, 8))
+        frame.columnconfigure(1, weight=1)
+        return frame
+
+    def _entry(self, parent, row: int, label: str, var, browse=None) -> None:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky='w', padx=(0, 8), pady=2)
+        entry = ttk.Entry(parent, textvariable=var)
+        entry.grid(row=row, column=1, sticky='ew', pady=2)
+        self.inputs.append(entry)
+        if browse:
+            button = ttk.Button(parent, text='Browse...', command=browse)
+            button.grid(row=row, column=2, padx=(6, 0), pady=2)
+            self.inputs.append(button)
+
+    def _browse_dir(self, var):
+        def browse():
+            chosen = filedialog.askdirectory(
+                parent=self.root,
+                initialdir=var.get() or None,
+                title='Select directory'
+            )
+            if chosen:
+                var.set(chosen)
+        return browse
+
+    def _browse_file(self, var):
+        def browse():
+            chosen = filedialog.askopenfilename(parent=self.root, title='Select file')
+            if chosen:
+                var.set(chosen)
+        return browse
+
+    def _copy_command(self) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.v_preview.get())
+
+    def _collect_options(self) -> List[str]:
+        """Translate the form into command line options for this script.
+        Raises ValueError with a user-facing message if the input is invalid."""
+        dt_from = self.v_from.get().strip()
+        dt_to = self.v_to.get().strip()
+        try:
+            start = parse_datetime(dt_from) if dt_from else None
+            end = parse_datetime(dt_to, end_of_day=True) if dt_to else None
+        except argparse.ArgumentTypeError as exc:
+            raise ValueError(str(exc)) from None
+        if start and end and start > end:
+            raise ValueError('The start datetime must not be later than the end datetime.')
+
+        selected = [op for op in ALL_OPERATIONS if self.v_ops[op].get()]
+        if not selected:
+            raise ValueError('Select at least one SQL operation.')
+
+        try:
+            jobs = int(self.v_jobs.get())
+        except ValueError:
+            raise ValueError('Parallel jobs must be a whole number.') from None
+        if jobs < 1:
+            raise ValueError('Parallel jobs must be at least 1.')
+
+        log_dir = self.v_log_dir.get().strip()
+        log_name = self.v_log_name.get().strip()
+        mysqlbinlog = self.v_mysqlbinlog.get().strip()
+        if not log_dir:
+            raise ValueError('Please enter the directory of the binary logs.')
+        if not log_name:
+            raise ValueError('Please enter the base name of the binary logs.')
+        if not mysqlbinlog:
+            raise ValueError('Please enter the mysqlbinlog executable.')
+
+        options = [f'--sql-operations={",".join(selected)}',
+                   f'--binary-logs-file-path={log_dir}',
+                   f'--binary-logs-file-name={log_name}',
+                   f'--jobs={jobs}',
+                   f'--mysqlbinlog={mysqlbinlog}']
+        if dt_from:
+            options.append(f'--dt-from={dt_from}')
+        if dt_to:
+            options.append(f'--dt-to={dt_to}')
+        output = self.v_output.get().strip()
+        if output:
+            options.append(f'--output-path={output}')
+        if self.v_ignore_mtime.get():
+            options.append('--ignore-mtime')
+        if self.v_no_skip_gtid.get():
+            options.append('--no-skip-gtid-strict-mode')
+        if self.v_write_queries.get():
+            try:
+                samples = int(self.v_samples.get())
+            except ValueError:
+                raise ValueError('Samples per table must be a whole number (0 = all).') from None
+            if samples < 0:
+                raise ValueError('Samples per table must be 0 (all) or a positive number.')
+            options += ['--write-queries', f'--query-samples={samples}']
+        return options
+
+    def _on_change(self, *_) -> None:
+        try:
+            options = self._collect_options()
+        except ValueError as exc:
+            self.v_preview.set(f'# {exc}')
+        else:
+            self.v_preview.set(shlex.join([Path(SCRIPT_PATH).name, *options]))
+        self._refresh_states()
+
+    def _refresh_states(self) -> None:
+        running = self.process is not None
+        for widget in self.inputs:
+            widget.state(['disabled'] if running else ['!disabled'])
+        if not running and not self.v_write_queries.get():
+            self.samples_spin.state(['disabled'])
+        self.start_button.state(['disabled'] if running else ['!disabled'])
+        self.cancel_button.state(['!disabled'] if running else ['disabled'])
+        can_show = not running and bool(self.report_path) and Path(self.report_path).is_file()
+        self.report_button.state(['!disabled'] if can_show else ['disabled'])
+
+    # ----  running the analysis  ----
+    def start(self) -> None:
+        if self.process is not None:
+            return
+        try:
+            options = self._collect_options()
+        except ValueError as exc:
+            messagebox.showerror('Invalid input', str(exc), parent=self.root)
+            return
+
+        command = [sys.executable or 'python3', '-u', SCRIPT_PATH, *options, '--no-color']
+        self._log('$ ' + shlex.join([Path(SCRIPT_PATH).name, *options]) + '\n', 'tool')
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors='replace',
+                bufsize=1,
+                start_new_session=True,
+                env={**os.environ, 'NO_COLOR': '1', 'PYTHONUNBUFFERED': '1'}
+            )
+        except OSError as exc:
+            self.process = None
+            messagebox.showerror('Could not start the analysis', str(exc), parent=self.root)
+            return
+
+        self.cancelled = False
+        self.report_path = None
+        self.progress.configure(maximum=1, value=0)
+        self.v_status.set('Running ...')
+        self._refresh_states()
+        threading.Thread(target=self._reader, args=(self.process,), daemon=True).start()
+
+    def _reader(self, process: subprocess.Popen) -> None:
+        """Worker thread: forward the child's output to the GUI thread via a queue."""
+        try:
+            for line in process.stdout:
+                self.messages.put(('line', line))
+        finally:
+            self.messages.put(('done', process.wait()))
+
+    def _poll(self) -> None:
+        for _ in range(500):  # bounded, so a burst of output can't freeze the window
+            try:
+                kind, payload = self.messages.get_nowait()
+            except queue.Empty:
+                break
+            if kind == 'line':
+                self._handle_line(payload)
+            else:
+                self._finished(payload)
+        self.root.after(self.POLL_MS, self._poll)
+
+    @staticmethod
+    def _tag_for(text: str) -> Optional[str]:
+        if text.startswith('ERROR:') or ': error: ' in text:
+            return 'error'
+        if text.startswith('WARNING:'):
+            return 'warning'
+        if 'successfully' in text:
+            return 'success'
+        return None
+
+    def _handle_line(self, line: str) -> None:
+        text = line.rstrip('\n')
+        match = REPORT_LINE_RE.match(text)
+        if match:
+            self.report_path = match.group(1)
+        match = PROGRESS_RE.match(text)
+        if match:
+            done, total = int(match.group(1)), int(match.group(2))
+            self.progress.configure(maximum=max(total, 1), value=done)
+            self.v_status.set(f'Running ... {done}/{total} binary logs analyzed')
+        self._log(text + '\n', self._tag_for(text))
+
+    def _finished(self, returncode: int) -> None:
+        self.process = None
+        if returncode == 0:
+            text, tag = 'Finished successfully.', 'success'
+        elif self.cancelled:
+            text, tag = 'Cancelled.', 'warning'
+        else:
+            text, tag = f'Failed (exit code {returncode}).', 'error'
+        self.v_status.set(text)
+        self._log(f'--- {text}\n', tag)
+        self._refresh_states()
+
+    @staticmethod
+    def _interrupt(process: subprocess.Popen) -> None:
+        """Same as Ctrl+C in a terminal: SIGINT for the whole process group (analyzer,
+        its workers and mysqlbinlog), so the analyzer can still clean up after itself."""
+        try:
+            if hasattr(os, 'killpg'):
+                os.killpg(process.pid, signal.SIGINT)
+            else:
+                process.terminate()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen) -> None:
+        """Last resort if the process ignored the interrupt."""
+        try:
+            if hasattr(os, 'killpg'):
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.kill()
+        except OSError:
+            pass
+
+    def cancel(self) -> None:
+        process = self.process
+        if process is None or self.cancelled:
+            return
+        self.cancelled = True
+        self.v_status.set('Cancelling ...')
+        self._log('Cancelling ...\n', 'warning')
+        self._interrupt(process)
+        self.root.after(5000, lambda: self._terminate(process) if self.process is process else None)
+
+    def on_close(self) -> None:
+        process = self.process
+        if process is not None:
+            if not messagebox.askyesno(
+                    'Analysis running',
+                    'An analysis is still running.\n\nCancel it and quit?',
+                    parent=self.root
+            ):
+                return
+            self._interrupt(process)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._terminate(process)
+        self.root.destroy()
+
+    def _log(self, text: str, tag: Optional[str] = None) -> None:
+        self.log.configure(state='normal')
+        self.log.insert('end', text, tag or ())
+        self.log.see('end')
+        self.log.configure(state='disabled')
+
+    def clear_log(self) -> None:
+        self.log.configure(state='normal')
+        self.log.delete('1.0', 'end')
+        self.log.configure(state='disabled')
+
+    def show_report(self) -> None:
+        if not self.report_path:
+            return
+        try:
+            text = Path(self.report_path).read_text(encoding='utf-8', errors='replace')
+        except OSError as exc:
+            messagebox.showerror('Could not open the report', str(exc), parent=self.root)
+            return
+        window = tk.Toplevel(self.root)
+        window.title(Path(self.report_path).name)
+        window.geometry('720x600')
+        viewer = scrolledtext.ScrolledText(window, wrap='none', font='TkFixedFont')
+        viewer.insert('1.0', text)
+        viewer.configure(state='disabled')
+        viewer.pack(fill='both', expand=True)
+
+
+def run_gui(args: argparse.Namespace) -> int:
+    """Start the GUI if tkinter is available, otherwise explain what is missing."""
+    if not load_tkinter():
+        Printer.error(TKINTER_MISSING_MESSAGE)
+        return 1
+    try:
+        gui = BinlogGui(args)
+    except tk.TclError as exc:  # Show error if no display is available (headless server, plain SSH session)
+        Printer.error(f'The GUI could not be started: {exc}')
+        return 1
+    return gui.mainloop()
+
+
 # ========  MAIN LOGIC  ========
 def run(cfg: Config) -> int:
     print_config(cfg)
@@ -728,6 +1238,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.no_color:
         Printer.color_enabled = False
+    if args.gui:
+        return run_gui(args)
     cfg = build_config(args, parser)
     try:
         return run(cfg)
