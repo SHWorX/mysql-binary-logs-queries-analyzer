@@ -972,9 +972,6 @@ class BinlogGui:
             button.pack(side='left', padx=(0, 6))
         ttk.Button(buttons, text='Quit', command=self.on_close).pack(side='right')
 
-        # self.log = scrolledtext.ScrolledText(mainWindow, height=14, wrap='word', state='disabled', font='TkFixedFont')
-        # self.log.grid(row=6, column=0, sticky='nsew', pady=(10, 0))
-
         log_frame = ttk.Frame(mainWindow)
         log_frame.grid(row=6, column=0, sticky='nsew', pady=(10, 0))
         log_frame.columnconfigure(0, weight=1)
