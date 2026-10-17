@@ -1,9 +1,16 @@
 # Changelog
 
+## [1.1.0] - 2026-10-17
+
+### Added
+
+The release 1.1.0 adds a new argument `--gui` to the tool, if this argument is passed, the tool with be started in GUI mode.
+
 ## [1.0.0] - 2026-10-10
 The script was completely overhauled/refactored, and I did several code optimizations. Furthermore, I've added some new functionality and fixed several bugs.
 
 After several tests, I decided to release this script now as stable v1.0.0.
+
 ### Added
 
 New options:
