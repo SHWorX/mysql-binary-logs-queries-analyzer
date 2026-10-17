@@ -33,10 +33,10 @@ The tool reads local binary-log files. It does not connect to a MySQL/MariaDB se
 
 ## Installation
 
-Save the script as, for example, `analyze-mysql-binlogs-queries.py`, then make it executable:
+Save the script as, for example, `analyze-mysql-binlogs-queries`, then make it executable:
 
 ```bash
-chmod +x analyze-mysql-binlogs-queries.py
+chmod +x analyze-mysql-binlogs-queries
 ```
 
 Check that Python and `mysqlbinlog` are available:
@@ -55,7 +55,7 @@ If the executable is not on `PATH`, pass its absolute path with `--mysqlbinlog`.
 Analyze today's binary logs using the defaults:
 
 ```bash
-./analyze-mysql-binlogs-queries.py
+./analyze-mysql-binlogs-queries
 ```
 
 By default, the script:
@@ -70,29 +70,30 @@ By default, the script:
 To see all command-line options:
 
 ```bash
-./analyze-mysql-binlogs-queries.py --help
+./analyze-mysql-binlogs-queries --help
 ```
 
 ## Command-line options
 
 Options may be supplied in any order. The short and long forms shown below are alternatives for the same option.
 
-| Option | Default | Description |
-|---|---|---|
-| `-h`, `--help` | — | Show the command-line help and exit. Provided by Python's `argparse`. |
-| `-f DATETIME`, `--dt-from DATETIME` | Today at `00:00:00` | Inclusive start of the analysis period. |
-| `-t DATETIME`, `--dt-to DATETIME` | Today at `23:59:59` | Inclusive end of the analysis period. |
-| `-n NAME`, `--binary-logs-file-name NAME` | `mysql-bin` | Binary-log base name, without the numeric suffix. |
-| `-p PATH`, `--binary-logs-file-path PATH` | `/var/lib/mysql` | Directory containing the binary logs. |
-| `-o PATH`, `--output-path PATH` | Current working directory | Existing directory in which output files are written. |
-| `-s OPS`, `--sql-operations OPS` | `all` | Comma-separated list of operation types to count. |
-| `-g`, `--no-skip-gtid-strict-mode` | Disabled | Never pass `--skip-gtid-strict-mode` to `mysqlbinlog`. |
-| `-j N`, `--jobs N` | `min(4, CPU count)` | Number of binary-log files to analyze concurrently. Must be at least `1`. |
-| `--mysqlbinlog BIN` | `mysqlbinlog` | Executable name or path for the `mysqlbinlog` utility. |
-| `--ignore-mtime` | Disabled | Do not pre-filter candidate log files by modification time. |
-| `-q`, `--write-queries` | Disabled | Also write sampled SQL or decoded row-event information to one file per selected operation type. |
-| `--query-samples N` | `1` | Maximum number of saved examples per operation and table when query output is enabled. `0` means all matches. |
-| `--no-color` | Disabled | Disable colored terminal output. |
+| Option                                    | Default | Description                                                                                                   |
+|-------------------------------------------|---|---------------------------------------------------------------------------------------------------------------|
+| `-h`, `--help`                            | — | Show the command-line help and exit. Provided by Python's `argparse`.                                         |
+| `-f DATETIME`, `--dt-from DATETIME`       | Today at `00:00:00` | Inclusive start of the analysis period.                                                                       |
+| `-t DATETIME`, `--dt-to DATETIME`         | Today at `23:59:59` | Inclusive end of the analysis period.                                                                         |
+| `-n NAME`, `--binary-logs-file-name NAME` | `mysql-bin` | Binary-log base name, without the numeric suffix.                                                             |
+| `-p PATH`, `--binary-logs-file-path PATH` | `/var/lib/mysql` | Directory containing the binary logs.                                                                         |
+| `-o PATH`, `--output-path PATH`           | Current working directory | Existing directory in which output files are written.                                                         |
+| `-s OPS`, `--sql-operations OPS`          | `all` | Comma-separated list of operation types to count.                                                             |
+| `-g`, `--no-skip-gtid-strict-mode`        | Disabled | Never pass `--skip-gtid-strict-mode` to `mysqlbinlog`.                                                        |
+| `-j N`, `--jobs N`                        | `min(4, CPU count)` | Number of binary-log files to analyze concurrently. Must be at least `1`.                                     |
+| `--mysqlbinlog BIN`                       | `mysqlbinlog` | Executable name or path for the `mysqlbinlog` utility.                                                        |
+| `--ignore-mtime`                          | Disabled | Do not pre-filter candidate log files by modification time.                                                   |
+| `-q`, `--write-queries`                   | Disabled | Also write sampled SQL or decoded row-event information to one file per selected operation type.              |
+| `--query-samples N`                       | `1` | Maximum number of saved examples per operation and table when query output is enabled. `0` means all matches. |
+| `--no-color`                              | Disabled | Disable colored terminal output.                                                                              |
+| `--gui`                                    | Disabled | Run the tool in GUI mode                                                                                      |
 
 ### Date and time formats
 
@@ -279,13 +280,13 @@ The tool streams decoded binary-log output instead of writing the full decoded l
 ### 1. Analyze today's logs with defaults
 
 ```bash
-./analyze-mysql-binlogs-queries.py
+./analyze-mysql-binlogs-queries
 ```
 
 ### 2. Analyze a specific full day
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   --dt-from 2026-10-01 \
   --dt-to 2026-10-01
 ```
@@ -293,7 +294,7 @@ The tool streams decoded binary-log output instead of writing the full decoded l
 ### 3. Analyze a time range across multiple days
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   -f "2026-10-01 08:00:00" \
   -t "2026-10-03 18:30:00"
 ```
@@ -301,7 +302,7 @@ The tool streams decoded binary-log output instead of writing the full decoded l
 ### 4. Use Unix timestamps
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   -f 1790812800 \
   -t 1790899199
 ```
@@ -311,7 +312,7 @@ Unix timestamps are interpreted using the host's local time zone when converted 
 ### 5. Use a custom binary-log directory and base name
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   -p /srv/mysql-logs \
   -n mariadb-bin \
   -f 2026-10-01 \
@@ -325,7 +326,7 @@ The directory must already exist and be writable:
 ```bash
 mkdir -p ./binlog-reports
 
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   -o ./binlog-reports \
   -f 2026-10-01 \
   -t 2026-10-01
@@ -334,7 +335,7 @@ mkdir -p ./binlog-reports
 ### 7. Count only updates and inserts
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   -s update,insert \
   -f 2026-10-01 \
   -t 2026-10-01
@@ -343,7 +344,7 @@ mkdir -p ./binlog-reports
 ### 8. Save one sample per operation and table
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   -q \
   -f 2026-10-01 \
   -t 2026-10-01
@@ -352,7 +353,7 @@ mkdir -p ./binlog-reports
 ### 9. Save up to five samples per operation and table
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   --write-queries \
   --query-samples 5 \
   -f 2026-10-01 \
@@ -362,7 +363,7 @@ mkdir -p ./binlog-reports
 ### 10. Save every matching sample
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   -q \
   --query-samples 0 \
   -f 2026-10-01 \
@@ -374,7 +375,7 @@ Use this carefully: large or busy binary-log sets may produce substantial output
 ### 11. Ignore filesystem modification times
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   --ignore-mtime \
   -p /srv/restored-binlogs \
   -f 2026-10-01 \
@@ -386,7 +387,7 @@ This is useful after copying or restoring logs when their mtimes no longer refle
 ### 12. Use one worker for troubleshooting
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   --jobs 1 \
   -f 2026-10-01 \
   -t 2026-10-01
@@ -395,7 +396,7 @@ This is useful after copying or restoring logs when their mtimes no longer refle
 ### 13. Specify a non-default `mysqlbinlog` executable
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   --mysqlbinlog /usr/bin/mysqlbinlog \
   -f 2026-10-01 \
   -t 2026-10-01
@@ -404,19 +405,19 @@ This is useful after copying or restoring logs when their mtimes no longer refle
 ### 14. Disable colored output
 
 ```bash
-./analyze-mysql-binlogs-queries.py --no-color
+./analyze-mysql-binlogs-queries --no-color
 ```
 
 You can also set `NO_COLOR` in the environment:
 
 ```bash
-NO_COLOR=1 ./analyze-mysql-binlogs-queries.py
+NO_COLOR=1 ./analyze-mysql-binlogs-queries
 ```
 
 ### 15. Combine common options
 
 ```bash
-./analyze-mysql-binlogs-queries.py \
+./analyze-mysql-binlogs-queries \
   --dt-from "2026-10-01 00:00:00" \
   --dt-to "2026-10-07 23:59:59" \
   --binary-logs-file-path /srv/mysql-logs \
@@ -429,6 +430,16 @@ NO_COLOR=1 ./analyze-mysql-binlogs-queries.py
 ```
 
 Ensure `/var/reports/mysql-binlogs` exists and is writable before running this command.
+
+### 16. GUI mode
+
+```bash
+./analyze-mysql-binlogs-queries --gui
+```
+![Logo with Brand and Slogan](./img/GUI.png)
+
+> When executing the script with the argument `--gui`, you can also pass other arguments, the values of the passed
+> arguments will be automatically used as default values for the related fields in the GUI.
 
 ## How operation counting works
 
