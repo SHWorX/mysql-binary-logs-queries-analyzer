@@ -26,6 +26,8 @@ How it works
 3. Merge the per-file counters and write a report plus a list of analyzed logs.
 4. Optionally (--write-queries) also collect sample SQL queries per operation and
    table and write them to one file per operation type.
+5. Optionally (--breakdown hour|day) count the operations per time bucket, using the
+   event timestamps found in the binary logs, to show when each table is busiest.
 
 Optional GUI
 ------------
@@ -36,6 +38,7 @@ command line mode does not depend on it. Any other options given together with
 """
 
 import argparse
+import csv
 import json
 import os
 import queue
@@ -48,7 +51,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -56,9 +59,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 # ========  CONSTANTS  ========
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 SCRIPT_PATH = os.path.abspath(__file__)
 ALL_OPERATIONS = ('update', 'insert', 'delete', 'truncate', 'drop')
+BREAKDOWN_MODES = ('none', 'hour', 'day')
 DEFAULT_LOG_DIR = Path('/var/lib/mysql')
 DEFAULT_LOG_NAME = 'mysql-bin'
 DEFAULT_MYSQLBINLOG = '/usr/bin/mysqlbinlog'
@@ -169,6 +173,7 @@ class Config:
     ignore_mtime: bool
     write_queries: bool = False
     query_samples: int = 1
+    breakdown: str = 'none'
 
 
 def parse_datetime(value: str, end_of_day: bool = False) -> datetime:
@@ -263,7 +268,7 @@ def build_parser() -> argparse.ArgumentParser:
         '--mysqlbinlog',
         default=DEFAULT_MYSQLBINLOG,
         metavar='BIN',
-        help='Name or path of the mysqlbinlog executable (default: {DEFAULT_MYSQLBINLOG}).')
+        help=f'Name or path of the mysqlbinlog executable (default: {DEFAULT_MYSQLBINLOG}).')
     parser.add_argument(
         '--ignore-mtime',
         action='store_true',
@@ -282,6 +287,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar='N',
         help='With --write-queries: how many example queries to keep per operation and table '
              '(default: 1). Use 0 to write ALL queries (can produce very large files).')
+    parser.add_argument(
+        '-b', '--breakdown',
+        choices=BREAKDOWN_MODES,
+        default='none',
+        help='Count operations per time bucket (hour or day) based on the binlog event timestamps and '
+             'write a CSV file plus a "busiest period per table" section in the report (default: none).')
     parser.add_argument(
         '--no-color',
         action='store_true',
@@ -340,7 +351,8 @@ def build_config(args: argparse.Namespace, parser: argparse.ArgumentParser) -> C
         dt_from=dt_from, dt_to=dt_to, log_dir=log_dir, log_name=args.binary_logs_file_name,
         output_dir=output_dir, operations=args.sql_operations, skip_gtid_strict_mode=skip_gtid,
         jobs=args.jobs, mysqlbinlog=mysqlbinlog, ignore_mtime=args.ignore_mtime,
-        write_queries=args.write_queries, query_samples=args.query_samples)
+        write_queries=args.write_queries, query_samples=args.query_samples,
+        breakdown=args.breakdown)
 
 
 def is_mariadb(mysqlbinlog: str) -> bool:
@@ -369,6 +381,7 @@ def print_config(cfg: Config) -> None:
         f'Parallel jobs:                {cfg.jobs}\n'
         f'mysqlbinlog:                  {cfg.mysqlbinlog}\n'
         f'Filter files by mtime:        {not cfg.ignore_mtime}\n'
+        f'Breakdown:                    {cfg.breakdown}\n'
         f'Write sample queries:         '
         f'{("yes (" + (str(cfg.query_samples) if cfg.query_samples else "all") + " per table)") if cfg.write_queries else "no"}')
     Printer.default('=====================================================')
@@ -435,6 +448,14 @@ def _clean_statement(lines: Sequence[str]) -> str:
     return text if text.endswith(';') else text + ';'
 
 
+def _bucket(day: str, clock: str, mode: str) -> str:
+    """'241206', '12:09:28' -> '2024-12-06 12:00' (hour) or '2024-12-06' (day)."""
+    date = f'20{day[0:2]}-{day[2:4]}-{day[4:6]}'
+    if mode == 'day':
+        return date
+    return f'{date} {clock.split(":", 1)[0].zfill(2)}:00'
+
+
 class _SampleWriter:
     """Collects the sampled queries of ONE binlog in a JSON-lines temp file (one entry
     per line), so memory use stays bounded however many queries are captured."""
@@ -473,19 +494,26 @@ class _SampleWriter:
 
 def analyze_file(base_command: Sequence[str], binlog: str, operations: Sequence[str],
                  samples_path: Optional[str] = None,
-                 samples_per_table: int = 1) -> Tuple[str, Dict[str, Counter]]:
+                 samples_per_table: int = 1,
+                 breakdown: str = 'none'
+                 ) -> Tuple[str, Dict[str, Counter], Dict[str, Dict[str, Counter]]]:
     """Run mysqlbinlog on one file and count operations per table while streaming
     its stdout. If *samples_path* is given, the full SQL of up to *samples_per_table*
-    queries per operation and table (0 = all) is also written there.
+    queries per operation and table (0 = all) is also written there. If *breakdown*
+    is 'hour' or 'day', the operations are additionally counted per time bucket.
 
     Runs in a worker process, so it only takes/returns picklable data."""
     wanted = set(operations)
     counts = {op: Counter() for op in operations}
     sampler = _SampleWriter(samples_path, Path(binlog).name, samples_per_table) if samples_path else None
+    bucket_mode = breakdown if breakdown != 'none' else None
+    timeline = {op: defaultdict(Counter) for op in operations} if bucket_mode else None
+    track_time = sampler is not None or bucket_mode is not None
 
     last_at = ''
     event_ts = ''
     event_pos = ''
+    bucket = 'unknown'
     rows_query: Optional[List[str]] = None
     collecting_rows_query = False
     row_lines: Optional[List[str]] = None
@@ -544,6 +572,8 @@ def analyze_file(base_command: Sequence[str], binlog: str, operations: Sequence[
                                 if op in wanted:
                                     table = _clean_name(match.group(2))
                                     counts[op][table] += 1
+                                    if timeline is not None:
+                                        timeline[op][table][bucket] += 1
                                     if sampler is not None and sampler.wants(op, table):
                                         row_lines = [line]
                                         row_meta = (op, table, event_ts, event_pos,
@@ -555,20 +585,23 @@ def analyze_file(base_command: Sequence[str], binlog: str, operations: Sequence[
 
                     first = line[:1]
                     if first == '#':
-                        if sampler is not None:
+                        if track_time:
                             if line.startswith('# at '):
                                 last_at = line[5:].strip()
                             elif line[1:2].isdigit():
                                 match = EVENT_RE.match(line)
                                 if match:
                                     day, clock, event_type = match.groups()
-                                    event_ts = f'20{day[0:2]}-{day[2:4]}-{day[4:6]} {clock.zfill(8)}'
-                                    event_pos = last_at
-                                    if event_type == 'Rows_query':
-                                        rows_query = []
-                                        collecting_rows_query = True
-                                    elif not event_type.startswith(ROW_EVENT_PREFIXES):
-                                        rows_query = None
+                                    if bucket_mode:
+                                        bucket = _bucket(day, clock, bucket_mode)
+                                    if sampler is not None:
+                                        event_ts = f'20{day[0:2]}-{day[2:4]}-{day[4:6]} {clock.zfill(8)}'
+                                        event_pos = last_at
+                                        if event_type == 'Rows_query':
+                                            rows_query = []
+                                            collecting_rows_query = True
+                                        elif not event_type.startswith(ROW_EVENT_PREFIXES):
+                                            rows_query = None
                         continue
 
                     if first in STATEMENT_FIRST_CHARS:
@@ -578,6 +611,8 @@ def analyze_file(base_command: Sequence[str], binlog: str, operations: Sequence[
                             if match:
                                 table = _clean_name(match.group(1))
                                 counts[keyword][table] += 1
+                                if timeline is not None:
+                                    timeline[keyword][table][bucket] += 1
                                 if sampler is not None and sampler.wants(keyword, table):
                                     stmt_lines = [line]
                                     stmt_meta = (keyword, table, event_ts, event_pos)
@@ -601,36 +636,44 @@ def analyze_file(base_command: Sequence[str], binlog: str, operations: Sequence[
                 message = '\n'.join(problems) or f'mysqlbinlog exited with code {process.returncode}'
                 raise BinlogAnalysisError(f'{binlog}: {message}')
 
-    return binlog, counts
+    return binlog, counts, ({op: dict(t) for op, t in timeline.items()} if timeline else {})
 
 
 def analyze_all(cfg: Config, binlogs: Sequence[str],
-                samples_dir: Optional[str] = None) -> Dict[str, Counter]:
+                samples_dir: Optional[str] = None
+                ) -> Tuple[Dict[str, Counter], Dict[str, Dict[str, Counter]]]:
     """Analyze all logs (in parallel if cfg.jobs > 1) and merge the counters. With
-    *samples_dir*, each worker also writes its sampled queries to <samples_dir>/<index>.jsonl."""
+    *samples_dir*, each worker also writes its sampled queries to <samples_dir>/<index>.jsonl.
+    Returns (totals per operation and table, per-bucket counts per operation and table)."""
     base_command = build_base_command(cfg)
     total = {op: Counter() for op in cfg.operations}
+    timeline: Dict[str, Dict[str, Counter]] = {op: defaultdict(Counter) for op in cfg.operations}
     done = 0
 
     def samples_path(index: int) -> Optional[str]:
         return os.path.join(samples_dir, f'{index}.jsonl') if samples_dir else None
 
-    def merge(path: str, counts: Dict[str, Counter]) -> None:
+    def merge(path: str, counts: Dict[str, Counter], per_bucket: Dict[str, Dict[str, Counter]]) -> None:
         nonlocal done
         done += 1
         for op, counter in counts.items():
             total[op].update(counter)
+        for op, tables in per_bucket.items():
+            for table, buckets in tables.items():
+                timeline[op][table].update(buckets)
         Printer.tool(f'  [{done}/{len(binlogs)}] {Path(path).name}')
 
     workers = min(cfg.jobs, len(binlogs))
     if workers <= 1:
         for index, binlog in enumerate(binlogs):
-            merge(*analyze_file(base_command, binlog, cfg.operations, samples_path(index), cfg.query_samples))
-        return total
+            merge(*analyze_file(base_command, binlog, cfg.operations, samples_path(index),
+                                cfg.query_samples, cfg.breakdown))
+        return total, timeline
 
     with ProcessPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(analyze_file, base_command, b, cfg.operations,
-                               samples_path(i), cfg.query_samples) for i, b in enumerate(binlogs)]
+                               samples_path(i), cfg.query_samples, cfg.breakdown)
+                   for i, b in enumerate(binlogs)]
         try:
             for future in as_completed(futures):
                 merge(*future.result())
@@ -638,7 +681,7 @@ def analyze_all(cfg: Config, binlogs: Sequence[str],
             for future in futures:
                 future.cancel()
             raise
-    return total
+    return total, timeline
 
 
 # ========  OUTPUT FILES  ========
@@ -654,7 +697,17 @@ def write_file_list(binlogs: Sequence[str], path: Path) -> None:
         handle.write('\n'.join(binlogs) + '\n')
 
 
-def write_report(counts: Dict[str, Counter], cfg: Config, binlogs: Sequence[str], path: Path) -> None:
+def _table_buckets(timeline: Dict[str, Dict[str, Counter]], operations: Sequence[str]) -> Dict[str, Counter]:
+    """table -> Counter(bucket), summed over the selected operations."""
+    merged: Dict[str, Counter] = defaultdict(Counter)
+    for op in operations:
+        for table, buckets in timeline.get(op, {}).items():
+            merged[table].update(buckets)
+    return merged
+
+
+def write_report(counts: Dict[str, Counter], cfg: Config, binlogs: Sequence[str], path: Path,
+                 timeline: Optional[Dict[str, Dict[str, Counter]]] = None) -> None:
     with _open_private(path) as handle:
         handle.write(
             f'Binary logs report\n'
@@ -670,6 +723,31 @@ def write_report(counts: Dict[str, Counter], cfg: Config, binlogs: Sequence[str]
             for table, number in sorted(counter.items(), key=lambda item: (-item[1], item[0])):
                 handle.write(f'{number:>12}  {table}\n')
             handle.write('\n')
+
+        if cfg.breakdown != 'none' and timeline is not None:
+            handle.write(f'BUSIEST {cfg.breakdown.upper()} PER TABLE (all selected operations)\n{"=" * 30}\n')
+            merged = _table_buckets(timeline, cfg.operations)
+            if not merged:
+                handle.write('  (none)\n')
+            for table, buckets in sorted(merged.items(), key=lambda i: (-sum(i[1].values()), i[0])):
+                top = sorted(buckets.items(), key=lambda i: (-i[1], i[0]))[:3]
+                peaks = ', '.join(f'{b} ({n})' for b, n in top)
+                handle.write(f'{sum(buckets.values()):>12}  {table}  peak: {peaks}\n')
+            handle.write('\n')
+
+
+def write_breakdown(timeline: Dict[str, Dict[str, Counter]], cfg: Config, path: Path) -> None:
+    """Write the full per-bucket detail as CSV: <hour|day>,table,operation,count."""
+    with _open_private(path) as handle:
+        writer = csv.writer(handle, lineterminator='\n')
+        writer.writerow([cfg.breakdown, 'table', 'operation', 'count'])
+        rows = sorted(
+            (bucket, table, op, number)
+            for op, tables in timeline.items()
+            for table, buckets in tables.items()
+            for bucket, number in buckets.items()
+        )
+        writer.writerows(rows)
 
 
 def write_query_files(cfg: Config, binlogs: Sequence[str], samples_dir: str,
@@ -787,6 +865,7 @@ class BinlogGui:
         self.v_output = tk.StringVar(value=str(args.output_path or Path.cwd()))
         self.v_ops = {op: tk.BooleanVar(value=op in args.sql_operations) for op in ALL_OPERATIONS}
         self.v_jobs = tk.StringVar(value=str(args.jobs))
+        self.v_breakdown = tk.StringVar(value=args.breakdown)
         self.v_mysqlbinlog = tk.StringVar(value=args.mysqlbinlog)
         self.v_ignore_mtime = tk.BooleanVar(value=args.ignore_mtime)
         self.v_no_skip_gtid = tk.BooleanVar(value=args.no_skip_gtid_strict_mode)
@@ -797,8 +876,8 @@ class BinlogGui:
 
     def _variables(self) -> list:
         return [self.v_from, self.v_to, self.v_log_dir, self.v_log_name, self.v_output,
-                *self.v_ops.values(), self.v_jobs, self.v_mysqlbinlog, self.v_ignore_mtime,
-                self.v_no_skip_gtid, self.v_write_queries, self.v_samples]
+                *self.v_ops.values(), self.v_jobs, self.v_breakdown, self.v_mysqlbinlog,
+                self.v_ignore_mtime, self.v_no_skip_gtid, self.v_write_queries, self.v_samples]
 
     def _create_widgets(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -806,7 +885,7 @@ class BinlogGui:
         mainWindow = ttk.Frame(self.root, padding=10)
         mainWindow.grid(row=0, column=0, sticky='nsew')
         mainWindow.columnconfigure(0, weight=1)
-        mainWindow.rowconfigure(6, weight=1)  # the log grows with the window
+        mainWindow.rowconfigure(6, weight=1)
 
         period = self._group(mainWindow, 0, 'Period  (YYYY-MM-DD, YYYY-MM-DD HH:MM:SS or Unix timestamp)')
         self._entry(period, 0, 'From:', self.v_from)
@@ -830,10 +909,20 @@ class BinlogGui:
         jobs = ttk.Spinbox(options, from_=1, to=256, width=6, textvariable=self.v_jobs)
         jobs.grid(row=0, column=1, sticky='w', pady=2)
         self.inputs.append(jobs)
+        ttk.Label(options, text='Breakdown:').grid(row=0, column=2, sticky='e', padx=(18, 8), pady=2)
+        breakdown = ttk.Combobox(
+            options,
+            values=BREAKDOWN_MODES,
+            width=8,
+            state='readonly',
+            textvariable=self.v_breakdown
+        )
+        breakdown.grid(row=0, column=3, sticky='w', pady=2)
+        self.inputs.append(breakdown)
         self._entry(options, 1, 'mysqlbinlog:', self.v_mysqlbinlog, self._browse_file(self.v_mysqlbinlog))
 
         flags = ttk.Frame(options)
-        flags.grid(row=2, column=0, columnspan=3, sticky='w', pady=(4, 0))
+        flags.grid(row=2, column=0, columnspan=4, sticky='w', pady=(4, 0))
         ignore_mtime = ttk.Checkbutton(
             flags,
             text='Ignore file modification times (--ignore-mtime)',
@@ -883,8 +972,21 @@ class BinlogGui:
             button.pack(side='left', padx=(0, 6))
         ttk.Button(buttons, text='Quit', command=self.on_close).pack(side='right')
 
-        self.log = scrolledtext.ScrolledText(mainWindow, height=14, wrap='word', state='disabled', font='TkFixedFont')
-        self.log.grid(row=6, column=0, sticky='nsew', pady=(10, 0))
+        # self.log = scrolledtext.ScrolledText(mainWindow, height=14, wrap='word', state='disabled', font='TkFixedFont')
+        # self.log.grid(row=6, column=0, sticky='nsew', pady=(10, 0))
+
+        log_frame = ttk.Frame(mainWindow)
+        log_frame.grid(row=6, column=0, sticky='nsew', pady=(10, 0))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.log = tk.Text(log_frame, height=14, wrap='none', state='disabled', font='TkFixedFont')
+        log_y = ttk.Scrollbar(log_frame, orient='vertical', command=self.log.yview)
+        log_x = ttk.Scrollbar(log_frame, orient='horizontal', command=self.log.xview)
+        self.log.configure(yscrollcommand=log_y.set, xscrollcommand=log_x.set)
+        self.log.grid(row=0, column=0, sticky='nsew')
+        log_y.grid(row=0, column=1, sticky='ns')
+        log_x.grid(row=1, column=0, sticky='ew')
+
         for tag, color in self.LOG_COLORS.items():
             self.log.tag_configure(tag, foreground=color)
 
@@ -961,6 +1063,7 @@ class BinlogGui:
         log_dir = self.v_log_dir.get().strip()
         log_name = self.v_log_name.get().strip()
         mysqlbinlog = self.v_mysqlbinlog.get().strip()
+
         if not log_dir:
             raise ValueError('Please enter the directory of the binary logs.')
         if not log_name:
@@ -968,11 +1071,14 @@ class BinlogGui:
         if not mysqlbinlog:
             raise ValueError('Please enter the mysqlbinlog executable.')
 
-        options = [f'--sql-operations={",".join(selected)}',
-                   f'--binary-logs-file-path={log_dir}',
-                   f'--binary-logs-file-name={log_name}',
-                   f'--jobs={jobs}',
-                   f'--mysqlbinlog={mysqlbinlog}']
+        options = [
+            f'--sql-operations={",".join(selected)}',
+            f'--binary-logs-file-path={log_dir}',
+            f'--binary-logs-file-name={log_name}',
+            f'--jobs={jobs}',
+            f'--mysqlbinlog={mysqlbinlog}'
+        ]
+
         if dt_from:
             options.append(f'--dt-from={dt_from}')
         if dt_to:
@@ -992,6 +1098,8 @@ class BinlogGui:
             if samples < 0:
                 raise ValueError('Samples per table must be 0 (all) or a positive number.')
             options += ['--write-queries', f'--query-samples={samples}']
+        if self.v_breakdown.get() != 'none':
+            options.append(f'--breakdown={self.v_breakdown.get()}')
         return options
 
     def _on_change(self, *_) -> None:
@@ -1207,18 +1315,22 @@ def run(cfg: Config) -> int:
     stamp = f'{datetime.now():%Y-%m-%d}_{int(time.time())}'
     report_file = cfg.output_dir / f'{stamp}_binary-logs-report.txt'
     list_file = cfg.output_dir / f'{stamp}_binary-logs-list.txt'
+    breakdown_file: Optional[Path] = None
 
     samples_dir = (tempfile.mkdtemp(prefix='.binlog-queries-', dir=cfg.output_dir)
                    if cfg.write_queries else None)
     try:
         Printer.tool(f'Analyzing binary logs with {min(cfg.jobs, len(binlogs))} worker(s) ...')
         started = time.monotonic()
-        counts = analyze_all(cfg, binlogs, samples_dir)
+        counts, timeline = analyze_all(cfg, binlogs, samples_dir)
         Printer.default(f'Analysis finished in {time.monotonic() - started:.1f}s.')
 
         Printer.tool('Writing output files ...')
         write_file_list(binlogs, list_file)
-        write_report(counts, cfg, binlogs, report_file)
+        write_report(counts, cfg, binlogs, report_file, timeline)
+        if cfg.breakdown != 'none':
+            breakdown_file = cfg.output_dir / f'{stamp}_binary-logs-breakdown-per-{cfg.breakdown}.csv'
+            write_breakdown(timeline, cfg, breakdown_file)
         query_files = write_query_files(cfg, binlogs, samples_dir, stamp) if samples_dir else {}
     finally:
         if samples_dir:
@@ -1226,9 +1338,11 @@ def run(cfg: Config) -> int:
 
     Printer.success('All operations successfully executed!')
     Printer.default(f'Matched binary log files list: {list_file}')
-    Printer.default(f'Generated report file:        {report_file}')
+    Printer.default(f'Generated report file: {report_file}')
+    if breakdown_file:
+        Printer.default(f'Breakdown file: {breakdown_file}')
     for op, path in query_files.items():
-        Printer.default(f'{op.upper() + " queries:":<30}{path}')
+        Printer.default(f'{op.upper() + " queries:"} {path}')
     Printer.default('')
     return 0
 
